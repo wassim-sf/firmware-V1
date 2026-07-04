@@ -5,8 +5,10 @@
 
 use heapless::Vec;
 
+pub const MAV_SYS_STATUS_SENSOR_3D_GYRO: u32 = 1 << 0;
 pub const MAV_SYS_STATUS_SENSOR_3D_ACCEL: u32 = 1 << 1;
-pub const MAV_SYS_STATUS_SENSOR_3D_GYRO: u32 = 1 << 2;
+pub const MAV_SYS_STATUS_SENSOR_3D_MAG: u32 = 1 << 2;
+pub const MAV_SYS_STATUS_SENSOR_GPS: u32 = 1 << 5;
 
 const STX_V2: u8 = 0xFD;
 const SYSTEM_ID: u8 = 1;
@@ -46,7 +48,7 @@ const CRC_SCKY_IMU_STATUS: u8 = 38;
 const MSG_SCKY_ESC_TELEM: u32 = 42_010;
 const CRC_SCKY_ESC_TELEM: u8 = 91;
 const MSG_SCKY_ESC_CONFIG: u32 = 42_011;
-const CRC_SCKY_ESC_CONFIG: u8 = 55;
+const CRC_SCKY_ESC_CONFIG: u8 = 33;
 
 // Inbound (ground-station → FC) message ids + crc_extra, used by `Decoder`.
 const MSG_COMMAND_LONG: u32 = 76;
@@ -54,7 +56,7 @@ const CRC_COMMAND_LONG: u8 = 152;
 const MSG_COMMAND_ACK: u32 = 77;
 const CRC_COMMAND_ACK: u8 = 143;
 const MSG_SCKY_ESC_SET: u32 = 42_012;
-const CRC_SCKY_ESC_SET: u8 = 8;
+const CRC_SCKY_ESC_SET: u8 = 154;
 const MSG_SCKY_ESC_CMD: u32 = 42_013;
 const CRC_SCKY_ESC_CMD: u8 = 106;
 
@@ -85,21 +87,28 @@ impl Encoder {
         self.frame(MSG_HEARTBEAT, CRC_HEARTBEAT, p.as_slice())
     }
 
-    pub fn sys_status(&mut self, sensors_present: u32, sensors_healthy: u32) -> Frame {
+    pub fn sys_status(
+        &mut self,
+        sensors_present: u32,
+        sensors_healthy: u32,
+        voltage_mv: u16,
+        current_ca: i16,
+        remaining_pct: i8,
+    ) -> Frame {
         let mut p = Payload::new();
         p.u32(sensors_present);
         p.u32(sensors_present); // all detected sensors are enabled
         p.u32(sensors_healthy);
         p.u16(0); // load unavailable
-        p.u16(u16::MAX); // battery voltage unavailable
-        p.i16(-1); // battery current unavailable
+        p.u16(voltage_mv); // battery voltage (mV); u16::MAX = unavailable
+        p.i16(current_ca); // battery current (cA); -1 = unavailable
         p.u16(0); // drop_rate_comm
         p.u16(0); // errors_comm
         p.u16(0); // errors_count1
         p.u16(0); // errors_count2
         p.u16(0); // errors_count3
         p.u16(0); // errors_count4
-        p.i8(-1); // battery remaining unavailable
+        p.i8(remaining_pct); // battery remaining (%); -1 = unavailable
         self.frame(MSG_SYS_STATUS, CRC_SYS_STATUS, p.as_slice())
     }
 
@@ -465,31 +474,34 @@ impl Encoder {
         self.frame(MSG_ESC_INFO, CRC_ESC_INFO, p.as_slice())
     }
 
-    /// SCKY_ESC_CONFIG (42011): echo of the live ESC configuration so the ground
-    /// station reflects the FC's actual state.
-    #[allow(clippy::too_many_arguments)]
+    /// SCKY_ESC_CONFIG (42011): echo of the live analog-PWM ESC configuration so
+    /// the ground station reflects the FC's actual state. Field order matches the
+    /// MAVLink size-sorted wire layout: two floats, then the uint16 arrays +
+    /// pwm_hz, then the uint8 array + master_enabled.
     pub fn esc_config(
         &mut self,
         cur_scale: f32,
         cur_offset: f32,
-        refresh_hz: u16,
-        protocol: u8,
+        min_us: [u16; 4],
+        max_us: [u16; 4],
+        pwm_hz: u16,
+        output_map: [u8; 4],
         master_enabled: bool,
-        bidir: bool,
-        dir_mask: u8,
-        pole_count: u8,
-        mode3d_mask: u8,
     ) -> Frame {
         let mut p = Payload::new();
         p.f32(cur_scale);
         p.f32(cur_offset);
-        p.u16(refresh_hz);
-        p.u8(protocol);
+        for v in min_us {
+            p.u16(v);
+        }
+        for v in max_us {
+            p.u16(v);
+        }
+        p.u16(pwm_hz);
+        for v in output_map {
+            p.u8(v);
+        }
         p.u8(master_enabled as u8);
-        p.u8(bidir as u8);
-        p.u8(dir_mask);
-        p.u8(pole_count);
-        p.u8(mode3d_mask);
         self.frame(MSG_SCKY_ESC_CONFIG, CRC_SCKY_ESC_CONFIG, p.as_slice())
     }
 
@@ -596,19 +608,18 @@ pub enum Inbound {
         timeout_s: f32,
         count: u8,
     },
-    /// SCKY_ESC_SET: write the live ESC configuration.
+    /// SCKY_ESC_SET: write the live analog-PWM ESC configuration.
     EscSet {
-        master_enabled: bool,
-        protocol: u8,
-        refresh_hz: u16,
-        bidir: bool,
-        dir_mask: u8,
-        mode3d_mask: u8,
-        pole_count: u8,
         cur_scale: f32,
         cur_offset: f32,
+        min_us: [u16; 4],
+        max_us: [u16; 4],
+        pwm_hz: u16,
+        output_map: [u8; 4],
+        master_enabled: bool,
     },
-    /// SCKY_ESC_CMD: one-shot DShot special command. `target` 0 = all, 1..4 = one.
+    /// SCKY_ESC_CMD: one-shot ESC action. `target` 0 = all, 1..4 = one motor;
+    /// `command` is an action code (see [`crate::esc`] `CMD_*`).
     EscCmd { target: u8, command: u16 },
 }
 
@@ -831,13 +842,11 @@ impl Decoder {
             MSG_SCKY_ESC_SET => Some(Inbound::EscSet {
                 cur_scale: f32_at(&p, 0),
                 cur_offset: f32_at(&p, 4),
-                refresh_hz: u16::from_le_bytes([p[8], p[9]]),
-                protocol: p[10],
-                master_enabled: p[11] != 0,
-                bidir: p[12] != 0,
-                dir_mask: p[13],
-                pole_count: p[14],
-                mode3d_mask: p[15],
+                min_us: [u16_at(&p, 8), u16_at(&p, 10), u16_at(&p, 12), u16_at(&p, 14)],
+                max_us: [u16_at(&p, 16), u16_at(&p, 18), u16_at(&p, 20), u16_at(&p, 22)],
+                pwm_hz: u16_at(&p, 24),
+                output_map: [p[26], p[27], p[28], p[29]],
+                master_enabled: p[30] != 0,
             }),
             MSG_SCKY_ESC_CMD => Some(Inbound::EscCmd {
                 target: p[2],
@@ -851,4 +860,9 @@ impl Decoder {
 #[inline]
 fn f32_at(p: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]])
+}
+
+#[inline]
+fn u16_at(p: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([p[off], p[off + 1]])
 }

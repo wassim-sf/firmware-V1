@@ -1,38 +1,69 @@
-//! ESC manager: configuration, per-motor test state, DShot command queue and
-//! the master safety interlock that sits between commands and the [`crate::dshot`]
-//! output.
+//! ESC manager for **analog / PWM ESCs**: per-motor throttle calibration, motor
+//! ordering, a throttle-range teach routine, and the master safety interlock
+//! that sits between commands and the [`crate::pwm`] output.
+//!
+//! The motors are simple analog ESCs that only understand standard servo PWM (a
+//! 1000..2000 µs pulse). There is no digital frame, no signal-wire telemetry and
+//! no special commands (direction / 3D / beacon) — spin direction is fixed by
+//! wiring, so it is handled here only by **remapping which physical output drives
+//! which logical motor**, never by a software reverse.
 //!
 //! There is no closed-loop flight control yet, so the **master enable** switch is
-//! the arm for persistent output. A standard MAVLink motor test may also
+//! the arm for spinning output. A standard MAVLink motor test may also
 //! temporarily enable the output path so bench testing does not depend on the
 //! custom ESC-config message landing first.
 //!
-//! Each of the four motors is independent: it carries its own throttle target,
-//! its own watchdog deadline and its own queue of DShot special commands. The
-//! host can therefore spin any subset of motors at once (four sliders in the
-//! ground station) without the motors interfering — earlier this state was a
-//! single shared "one motor at a time" slot, which made concurrently-driven
-//! motors alternate and read as "linked".
+//! # Calibration model (equal command → equal speed)
 //!
-//! # AM32 / BLHeli_32 alignment
-//!
-//! The output path mirrors what those ESC firmwares actually require:
-//!   * a *continuous* DShot stream — zero-throttle frames are emitted even while
-//!     disarmed so the ESC stays armed-idle instead of re-detecting the signal;
-//!   * **throttle is ramped, never stepped** (a propless motor desyncs on an
-//!     instant 0 → N jump and the ESC's stall protection cuts it);
-//!   * **special commands (direction / 3D / save / beacon) are only honoured at
-//!     zero throttle and must carry the telemetry-request bit** — without that
-//!     bit AM32/BLHeli ignore the command — and each is repeated several frames.
+//! Each motor carries its own `min_us` / `max_us` throttle endpoints. A throttle
+//! fraction `t ∈ [0,1]` maps to `min_us + t·(max_us − min_us)` for *that* motor,
+//! so trimming a motor's endpoints makes a shared throttle drive every motor at
+//! the same speed. A one-shot **range-teach routine** drives every channel to
+//! `max_us` then `min_us` so the ESCs themselves learn their throttle range.
 
-use crate::dshot::{make_frame, Protocol};
 use crate::esc_telem::TelemFrame;
 
-/// Number of motors / ESCs.
+/// Number of motors / ESCs (also the number of PWM output channels).
 pub const N_MOTORS: usize = 4;
 
-/// Latest decoded ESC telemetry, indexed by motor. Published by the telemetry
-/// UART interrupt and read by the USB task for `SCKY_ESC_TELEM`.
+/// Default motor magnetic pole count for the (now inert) BLHeli telemetry path.
+/// Analog ESCs send no telemetry, but the decoder still needs a pole count.
+pub const DEFAULT_POLE_COUNT: u8 = 14;
+
+/// Default / minimum servo-PWM endpoints, microseconds.
+const MIN_US_DEFAULT: u16 = 1000;
+const MAX_US_DEFAULT: u16 = 2000;
+/// Hard clamp so a bad host value can never command a wild pulse.
+const PULSE_MIN: u16 = 800;
+const PULSE_MAX: u16 = 2200;
+
+/// How long (ms) a motor test runs if the host does not refresh it. Also the
+/// watchdog horizon: if the host stops talking, motors stop within this window.
+pub const DEFAULT_TEST_TIMEOUT_MS: u32 = 3000;
+
+/// Range-teach routine phase durations (ms): full throttle held, then idle held.
+/// Safety timeout (ms): if the host leaves the ESCs held at a calibration
+/// endpoint (e.g. it disconnects mid-calibration), auto-return to idle.
+const CAL_SAFETY_MS: u32 = 30_000;
+
+/// Minimum span (µs) enforced between a motor's min and max endpoints.
+const MIN_SPAN_US: u16 = 50;
+
+/// Max pulse increase per output tick (µs). Throttle *up* is ramped so a
+/// free-spinning bench motor eases in rather than kicking; throttle *down*
+/// (including stop) is instant.
+const RAMP_STEP_US: u16 = 20;
+
+/// `EscCmd.command` action codes (analog ESCs take no DShot special commands).
+/// Calibration is a manual two-step hold so the operator controls the timing:
+/// hold MAX, connect the battery (ESC records full throttle), then set MIN.
+pub const CMD_CAL_MAX: u16 = 1;
+pub const CMD_CAL_MIN: u16 = 2;
+pub const CMD_STOP_ALL: u16 = 3;
+
+/// Latest decoded ESC telemetry, indexed by motor. Kept for the BLHeli/KISS
+/// telemetry UART path, which is inert with analog ESCs (no telemetry wire) but
+/// still populates the analog current sense aggregate via the ADC in `main`.
 #[derive(Clone, Copy)]
 pub struct EscTelemetry {
     pub rpm: [i32; N_MOTORS],
@@ -42,8 +73,7 @@ pub struct EscTelemetry {
     pub err: [u8; N_MOTORS],
     /// Consumption (mAh) of the most recently reported ESC.
     pub mah: u16,
-    /// Round-robin slot the next decoded record is attributed to (a single shared
-    /// telemetry wire carries no motor id — see [`crate::esc_telem`]).
+    /// Round-robin slot the next decoded record is attributed to.
     rr: usize,
 }
 
@@ -77,211 +107,160 @@ impl EscTelemetry {
     }
 }
 
-/// Lowest DShot throttle value (0..47 are reserved as special commands).
-const DSHOT_MIN_THROTTLE: u16 = 48;
-const DSHOT_MAX_THROTTLE: u16 = 2047;
-
-/// How long (ms) a motor test runs if the host does not refresh it. Also the
-/// watchdog horizon: if the host stops talking, motors stop within this window.
-pub const DEFAULT_TEST_TIMEOUT_MS: u32 = 3000;
-
-/// Times each queued DShot special command is repeated on the wire. AM32 /
-/// BLHeli_32 require a command to be seen several frames in a row before acting.
-const CMD_REPEATS: u8 = 10;
-
-/// Per-motor special-command FIFO depth. The common case is a 2-command
-/// sequence — e.g. spin-direction (20/21) immediately followed by save (12) —
-/// which must transmit in order; a single slot would drop the first.
-const CMD_DEPTH: usize = 6;
-
-/// Max throttle increase per output tick (DShot units). The throttle target is
-/// applied gradually, not as a step: a free-spinning (propless) motor desyncs on
-/// an instantaneous 0 → N jump — the motor kicks, AM32/BLHeli_32 stall protection
-/// trips and the motor stops ("starts then stops"). At the default 1 kHz refresh
-/// this ramps 0 → full over ~1 s, 0 → a 30 % test over ~300 ms. Throttle *down*
-/// (including stop) is applied instantly — reducing throttle never desyncs.
-const RAMP_STEP_PER_TICK: u16 = 2;
-
 /// Live, host-tunable ESC configuration. Mirrors `SCKY_ESC_CONFIG` /
 /// `SCKY_ESC_SET` on the wire.
 #[derive(Clone, Copy)]
 pub struct EscConfig {
-    /// Master output enable. **Defaults to `false`** — nothing spins until the
-    /// ground station explicitly turns it on.
+    /// Master output enable. **Defaults to `false`** — no motor spins until the
+    /// ground station explicitly turns it on. Idle (`min_us`) is still emitted so
+    /// the ESCs stay armed-idle.
     pub master_enabled: bool,
-    pub protocol: Protocol,
-    /// Output refresh rate (Hz). Capped to the 1 kHz monotonic tick in `main`.
-    pub refresh_hz: u16,
-    /// Bidirectional-DShot request flag (telemetry is read from the UART here, so
-    /// this is reflected to the GS but does not change the bit-bang output).
-    pub bidir: bool,
-    /// Bit per motor: 1 = last commanded spin direction was "reversed".
-    /// Informational reflection of the last direction command (direction is
-    /// stored on the ESC itself, not applied here).
-    pub dir_mask: u8,
-    /// Bit per motor: 1 = 3D mode last commanded on.
-    pub mode3d_mask: u8,
-    /// Motor magnetic pole count, for eRPM → RPM in [`crate::esc_telem`].
-    pub pole_count: u8,
-    /// Analog current-sense calibration (C pad): scale (A per volt-equivalent)
-    /// and offset (mV). See [`crate::esc_telem::analog_current_a`].
+    /// PWM carrier frequency (Hz). Applied to the timer at init; runtime changes
+    /// are reflected to the GS but only take effect on the next boot.
+    pub pwm_hz: u16,
+    /// Per-motor throttle endpoints (µs), indexed by **logical** motor.
+    pub min_us: [u16; N_MOTORS],
+    pub max_us: [u16; N_MOTORS],
+    /// Motor order remap: logical motor `i` drives physical output
+    /// `output_map[i]` (0..3 = PA0..PA3). Default identity `[0,1,2,3]`.
+    pub output_map: [u8; N_MOTORS],
+    /// Analog current-sense calibration (C pad): scale and offset (mV).
     pub cur_scale: f32,
     pub cur_offset: f32,
 }
 
-impl Default for EscConfig {
-    fn default() -> Self {
+impl EscConfig {
+    pub const fn new() -> Self {
         Self {
             master_enabled: false,
-            protocol: Protocol::Dshot150,
-            refresh_hz: 1000,
-            bidir: false,
-            dir_mask: 0,
-            mode3d_mask: 0,
-            pole_count: 14,
+            pwm_hz: 50,
+            min_us: [MIN_US_DEFAULT; N_MOTORS],
+            max_us: [MAX_US_DEFAULT; N_MOTORS],
+            output_map: [0, 1, 2, 3],
             cur_scale: 490.0, // SpeedyBee BL32 50A default
             cur_offset: 0.0,
         }
     }
 }
 
-/// A small in-order FIFO of pending DShot special commands for one motor. Each
-/// entry is `(dshot_code, repeats_left)`; the front entry is emitted every output
-/// tick and popped once its repeats are exhausted.
-#[derive(Clone, Copy)]
-struct CmdFifo {
-    items: [(u16, u8); CMD_DEPTH],
-    len: u8,
-}
-
-impl CmdFifo {
-    const fn new() -> Self {
-        Self { items: [(0, 0); CMD_DEPTH], len: 0 }
-    }
-
-    /// Enqueue a command to be repeated [`CMD_REPEATS`] times. Dropped silently if
-    /// the queue is full (only ever a runaway host would overflow `CMD_DEPTH`).
-    fn push(&mut self, code: u16) {
-        if (self.len as usize) < CMD_DEPTH {
-            self.items[self.len as usize] = (code, CMD_REPEATS);
-            self.len += 1;
-        }
-    }
-
-    /// Emit the front command's code for this tick, counting one repeat and
-    /// popping the entry when its repeats run out. `None` when the queue is empty.
-    fn next_code(&mut self) -> Option<u16> {
-        if self.len == 0 {
-            return None;
-        }
-        let (code, reps) = self.items[0];
-        if reps <= 1 {
-            for i in 1..self.len as usize {
-                self.items[i - 1] = self.items[i];
-            }
-            self.len -= 1;
-        } else {
-            self.items[0].1 = reps - 1;
-        }
-        Some(code)
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
+impl Default for EscConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Independent output state for one motor.
+/// Independent output state for one logical motor.
 #[derive(Clone, Copy)]
 struct MotorOut {
-    /// Target throttle (`48..2047`) or `0` = stop. Set by a motor test.
-    target: u16,
-    /// Monotonic deadline (ms) after which a non-zero target expires to stop —
-    /// the host must refresh the motor test to sustain a spin.
+    /// Target throttle fraction 0.0..1.0 (0 = idle). Set by a motor test.
+    target: f32,
+    /// Monotonic deadline (ms) after which a non-zero target expires to idle.
     until_ms: u32,
-    /// Throttle actually on the wire, slewed toward `target` each tick.
-    applied: u16,
-    /// Pending special commands (direction / 3D / save / beacon).
-    cmds: CmdFifo,
+    /// Pulse (µs) actually applied, slewed toward the target pulse each tick.
+    applied_us: u16,
 }
 
 impl MotorOut {
     const fn new() -> Self {
-        Self { target: 0, until_ms: 0, applied: 0, cmds: CmdFifo::new() }
+        Self { target: 0.0, until_ms: 0, applied_us: MIN_US_DEFAULT }
     }
 
     fn reset(&mut self) {
-        self.target = 0;
+        self.target = 0.0;
         self.until_ms = 0;
-        self.applied = 0;
-        self.cmds.clear();
+        self.applied_us = MIN_US_DEFAULT;
     }
 }
 
 const INIT_MOTOR: MotorOut = MotorOut::new();
 
+/// Throttle-range teach routine state. Each hold persists until the operator
+/// moves to the next step or the [`CAL_SAFETY_MS`] deadline elapses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CalPhase {
+    Idle,
+    /// Hold every channel at `max_us` (operator powers the ESCs now).
+    Max,
+    /// Hold every channel at `min_us` (ESCs record the low endpoint).
+    Min,
+}
+
 /// ESC controller state owned by the firmware and mutated by inbound commands.
 pub struct Esc {
     pub config: EscConfig,
     motors: [MotorOut; N_MOTORS],
+    cal_phase: CalPhase,
+    cal_until_ms: u32,
 }
 
-/// Slew the currently applied throttle toward `target`. Increases are capped at
-/// [`RAMP_STEP_PER_TICK`] and start at the lowest real throttle so a ramping
-/// throttle never emits a reserved 1..47 special command; decreases (incl. stop)
-/// are instant — reducing throttle never desyncs.
-fn slew(applied: u16, target: u16) -> u16 {
-    if target <= applied {
-        return target; // throttle down / stop: instant
+/// Slew the currently applied pulse toward `target_us`. Increases are capped at
+/// [`RAMP_STEP_US`]; decreases (incl. idle) are instant — reducing throttle never
+/// needs easing.
+fn slew(applied_us: u16, target_us: u16) -> u16 {
+    if target_us <= applied_us {
+        target_us
+    } else {
+        (applied_us + RAMP_STEP_US).min(target_us)
     }
-    let from = applied.max(DSHOT_MIN_THROTTLE);
-    (from + RAMP_STEP_PER_TICK).min(target)
 }
 
 impl Esc {
     pub const fn new() -> Self {
         Self {
-            // `EscConfig::default()` is not const; fill the fields explicitly.
-            config: EscConfig {
-                master_enabled: false,
-                protocol: Protocol::Dshot150,
-                refresh_hz: 1000,
-                bidir: false,
-                dir_mask: 0,
-                mode3d_mask: 0,
-                pole_count: 14,
-                cur_scale: 490.0,
-                cur_offset: 0.0,
-            },
+            config: EscConfig::new(),
             motors: [INIT_MOTOR; N_MOTORS],
+            cal_phase: CalPhase::Idle,
+            cal_until_ms: 0,
         }
     }
 
+    /// Pulse (µs) for a logical motor at throttle fraction `t`, using that
+    /// motor's own endpoints and clamped to the safe range.
+    fn pulse_for(&self, i: usize, t: f32) -> u16 {
+        let min = self.config.min_us[i];
+        let max = self.config.max_us[i];
+        let span = max.max(min) - min.min(max);
+        let lo = min.min(max);
+        let t = t.clamp(0.0, 1.0);
+        let us = lo as f32 + t * span as f32;
+        (us as u16).clamp(PULSE_MIN, PULSE_MAX)
+    }
+
     /// Apply a `SCKY_ESC_SET` config write. Disabling the master immediately
-    /// cancels all motor activity (the frame computed next tick is MOTOR_STOP).
+    /// cancels all motor activity (idle is emitted next tick).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_set(
         &mut self,
         master_enabled: bool,
-        protocol: u8,
-        refresh_hz: u16,
-        bidir: bool,
-        dir_mask: u8,
-        mode3d_mask: u8,
-        pole_count: u8,
+        pwm_hz: u16,
+        min_us: [u16; N_MOTORS],
+        max_us: [u16; N_MOTORS],
+        output_map: [u8; N_MOTORS],
         cur_scale: f32,
         cur_offset: f32,
     ) {
         self.config.master_enabled = master_enabled;
-        self.config.protocol = Protocol::from_u8(protocol);
-        self.config.refresh_hz = refresh_hz.clamp(50, 1000);
-        self.config.bidir = bidir;
-        self.config.dir_mask = dir_mask;
-        self.config.mode3d_mask = mode3d_mask;
-        self.config.pole_count = pole_count.clamp(2, 64);
+        self.config.pwm_hz = pwm_hz.clamp(50, 490);
+        for i in 0..N_MOTORS {
+            let mut lo = min_us[i].clamp(PULSE_MIN, PULSE_MAX);
+            let hi = max_us[i].clamp(PULSE_MIN, PULSE_MAX);
+            // Guard against min crossing max (the UI clamps too): keep a min span.
+            if lo + MIN_SPAN_US > hi {
+                lo = hi.saturating_sub(MIN_SPAN_US);
+            }
+            self.config.min_us[i] = lo;
+            self.config.max_us[i] = hi;
+            // Only accept a valid physical channel; otherwise keep identity.
+            self.config.output_map[i] = if (output_map[i] as usize) < N_MOTORS {
+                output_map[i]
+            } else {
+                i as u8
+            };
+        }
         self.config.cur_scale = cur_scale;
         self.config.cur_offset = cur_offset;
         if !master_enabled {
+            self.cal_phase = CalPhase::Idle;
             for m in self.motors.iter_mut() {
                 m.reset();
             }
@@ -294,39 +273,33 @@ impl Esc {
     /// work even if the custom `SCKY_ESC_SET` master toggle was not sent. A zero
     /// throttle is a per-motor stop and never arms the master.
     pub fn start_test(&mut self, motor: u8, throttle_pct: f32, timeout_ms: u32, now_ms: u32) -> bool {
-        // Be tolerant of host conventions: some tools send motor 0 for the
-        // first output even though MAV_CMD_DO_MOTOR_TEST is nominally 1-based.
+        // Be tolerant of host conventions: some tools send motor 0 for the first.
         let motor = if motor == 0 { 1 } else { motor };
         if motor as usize > N_MOTORS {
             return false;
         }
         let idx = motor as usize - 1;
-        // Some frontends encode 10% as 0.10 instead of 10.0. Accept both.
+        // Some frontends encode 10 % as 0.10 instead of 10.0. Accept both.
         let throttle_pct = if throttle_pct > 0.0 && throttle_pct <= 1.0 {
             throttle_pct * 100.0
         } else {
             throttle_pct
         };
-        let pct = throttle_pct.clamp(0.0, 100.0) / 100.0;
-        let span = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as f32;
-        let value = if pct <= 0.0 {
-            0
-        } else {
-            DSHOT_MIN_THROTTLE + (pct * span) as u16
-        };
-        // A zero or tiny timeout is nearly indistinguishable from "snaps back to
-        // zero" in the UI, so give bench motor tests a useful minimum window.
+        let frac = throttle_pct.clamp(0.0, 100.0) / 100.0;
+        // A zero or tiny timeout reads as "snaps back to zero" in the UI, so give
+        // bench motor tests a useful minimum window.
         let timeout = if timeout_ms < 500 {
             DEFAULT_TEST_TIMEOUT_MS
         } else {
             timeout_ms
         };
-        if value != 0 {
+        if frac > 0.0 {
             self.config.master_enabled = true;
+            self.cal_phase = CalPhase::Idle; // a test overrides an in-progress cal
         }
         let m = &mut self.motors[idx];
-        m.target = value;
-        if value != 0 {
+        m.target = frac;
+        if frac > 0.0 {
             m.until_ms = now_ms.wrapping_add(timeout);
         }
         true
@@ -334,104 +307,112 @@ impl Esc {
 
     /// Stop all motors immediately (clears every per-motor throttle target).
     pub fn stop_all(&mut self) {
+        self.cal_phase = CalPhase::Idle;
         for m in self.motors.iter_mut() {
-            m.target = 0;
+            m.target = 0.0;
         }
     }
 
-    /// Snapshot of the first actively-spinning motor for telemetry diagnostics:
-    /// `(motor_1_based, dshot_value, remaining_ms)`.
+    /// Calibration step 1: hold full throttle (`max_us`) on every channel so the
+    /// operator can power the ESCs and have them record the high endpoint. Held
+    /// until [`Self::cal_hold_min`] / stop, or the safety timeout. Arms the master
+    /// and cancels any motor test.
+    pub fn cal_hold_max(&mut self, now_ms: u32) {
+        self.config.master_enabled = true;
+        for m in self.motors.iter_mut() {
+            m.target = 0.0;
+        }
+        self.cal_phase = CalPhase::Max;
+        self.cal_until_ms = now_ms.wrapping_add(CAL_SAFETY_MS);
+    }
+
+    /// Calibration step 2: hold idle (`min_us`) on every channel so the ESCs
+    /// record the low endpoint and finish learning their range.
+    pub fn cal_hold_min(&mut self, now_ms: u32) {
+        self.config.master_enabled = true;
+        self.cal_phase = CalPhase::Min;
+        self.cal_until_ms = now_ms.wrapping_add(CAL_SAFETY_MS);
+    }
+
+    /// Abort calibration, returning to idle.
+    pub fn stop_calibration(&mut self) {
+        self.cal_phase = CalPhase::Idle;
+    }
+
+    /// Calibration state for diagnostics: `Some(true)` = holding MAX, `Some(false)`
+    /// = holding MIN, `None` = not calibrating.
+    pub fn cal_status(&self) -> Option<bool> {
+        match self.cal_phase {
+            CalPhase::Idle => None,
+            CalPhase::Max => Some(true),
+            CalPhase::Min => Some(false),
+        }
+    }
+
+    /// Snapshot of the first actively-spinning motor for diagnostics:
+    /// `(motor_1_based, pulse_us, remaining_ms)`.
     pub fn active_test(&self, now_ms: u32) -> Option<(u8, u16, u32)> {
         for (i, m) in self.motors.iter().enumerate() {
-            if m.target != 0 {
-                return Some((i as u8 + 1, m.target, m.until_ms.wrapping_sub(now_ms)));
+            if m.target > 0.0 {
+                return Some((i as u8 + 1, m.applied_us, m.until_ms.wrapping_sub(now_ms)));
             }
         }
         None
     }
 
-    /// Queue a DShot special command (`dshot_cmd`, e.g. 20/21 spin direction,
-    /// 9/10 3D off/on, 12 save, 1..5 beacon). `target` 0 = all motors, 1..4 = a
-    /// single motor. The motor's throttle is forced to zero first because
-    /// AM32/BLHeli only honour these commands at rest, and the command is queued
-    /// (not overwritten) so a direction-then-save sequence both transmit. Tracks
-    /// direction/3D in the config so the GS reflects intent.
-    pub fn queue_command(&mut self, target: u8, dshot_cmd: u16) {
-        if target == 0 {
-            self.config.master_enabled = true;
-            for m in self.motors.iter_mut() {
-                m.target = 0;
-                m.cmds.push(dshot_cmd);
-            }
-            self.track_command(0xFF, dshot_cmd);
-        } else if (target as usize) <= N_MOTORS {
-            self.config.master_enabled = true;
-            let idx = target as usize - 1;
-            self.motors[idx].target = 0;
-            self.motors[idx].cmds.push(dshot_cmd);
-            self.track_command(idx as u8, dshot_cmd);
-        }
-    }
-
-    /// Reflect direction/3D commands into the config masks (informational only).
-    fn track_command(&mut self, motor_idx: u8, dshot_cmd: u16) {
-        let set = |mask: &mut u8, on: bool| {
-            if motor_idx == 0xFF {
-                *mask = if on { 0x0F } else { 0 };
-            } else {
-                let bit = 1 << motor_idx;
-                if on {
-                    *mask |= bit;
-                } else {
-                    *mask &= !bit;
-                }
-            }
-        };
-        match dshot_cmd {
-            20 => set(&mut self.config.dir_mask, false), // spin normal
-            21 => set(&mut self.config.dir_mask, true),  // spin reversed
-            9 => set(&mut self.config.mode3d_mask, false), // 3D off
-            10 => set(&mut self.config.mode3d_mask, true), // 3D on
-            _ => {}
-        }
-    }
-
-    /// Compute the four DShot frames to transmit this tick.
+    /// Compute the PWM pulse (µs) for each **physical** output channel this tick.
     ///
-    /// Safety interlock: with the master disabled, every motor gets MOTOR_STOP and
-    /// all per-motor state is cleared. Otherwise, per motor: an expired test
-    /// target reverts to stop; a queued special command is drained (one repeat per
-    /// tick, **with the telemetry bit set**) but only while that motor is at rest;
-    /// then the throttle is slewed toward its target.
-    pub fn frames(&mut self, now_ms: u32) -> [u16; N_MOTORS] {
-        if !self.config.master_enabled {
-            for m in self.motors.iter_mut() {
-                m.reset();
-            }
-            return [make_frame(0, false); N_MOTORS];
+    /// Order of precedence: master interlock (disabled → every motor idle at its
+    /// `min_us`); then the range-teach routine (all channels max/min); then per
+    /// motor an expired test reverts to idle and the pulse is slewed toward the
+    /// throttle target. Logical motor `i` is finally placed on physical channel
+    /// `output_map[i]`.
+    pub fn pulses(&mut self, now_ms: u32) -> [u16; N_MOTORS] {
+        // Safety: a calibration hold left running past the deadline returns to idle.
+        if self.cal_phase != CalPhase::Idle
+            && now_ms.wrapping_sub(self.cal_until_ms) < u32::MAX / 2
+        {
+            self.cal_phase = CalPhase::Idle;
         }
 
-        let mut out = [make_frame(0, false); N_MOTORS];
+        // Range-teach: drive every physical channel to the STANDARD full/idle
+        // endpoint (1000/2000 µs), bypassing per-motor trim and the output remap.
+        // The ESC must see true full throttle at power-up to enter calibration, and
+        // every ESC should learn the same range, so trimmed `max_us` must not apply
+        // here. `cal_hold_*` already forced the master on.
+        match self.cal_phase {
+            CalPhase::Max => return [MAX_US_DEFAULT; N_MOTORS],
+            CalPhase::Min => return [MIN_US_DEFAULT; N_MOTORS],
+            CalPhase::Idle => {}
+        }
+
+        // Compute a pulse per logical motor, then remap to physical channels.
+        let mut logical = [MIN_US_DEFAULT; N_MOTORS];
         for i in 0..N_MOTORS {
-            let m = &mut self.motors[i];
-
-            // Watchdog: a spin the host stopped refreshing expires to stop.
-            if m.target != 0 && now_ms.wrapping_sub(m.until_ms) < u32::MAX / 2 {
-                m.target = 0;
-            }
-
-            // Special command (direction/3D/save/beacon): only honoured by the ESC
-            // at zero throttle, and only with the telemetry-request bit set.
-            if m.target == 0 && m.applied == 0 {
-                if let Some(code) = m.cmds.next_code() {
-                    out[i] = make_frame(code, true);
-                    continue;
+            logical[i] = if !self.config.master_enabled {
+                self.motors[i].reset();
+                self.config.min_us[i]
+            } else {
+                // Watchdog: a spin the host stopped refreshing expires to idle.
+                if self.motors[i].target > 0.0
+                    && now_ms.wrapping_sub(self.motors[i].until_ms) < u32::MAX / 2
+                {
+                    self.motors[i].target = 0.0;
                 }
-            }
+                let target_us = self.pulse_for(i, self.motors[i].target);
+                let next = slew(self.motors[i].applied_us, target_us);
+                self.motors[i].applied_us = next;
+                next
+            };
+        }
 
-            // Slew toward the target so the ESC never sees a throttle step.
-            m.applied = slew(m.applied, m.target);
-            out[i] = make_frame(m.applied, false);
+        // Remap: logical motor i -> physical channel output_map[i].
+        let mut out = [MIN_US_DEFAULT; N_MOTORS];
+        for i in 0..N_MOTORS {
+            let ch = self.config.output_map[i] as usize;
+            if ch < N_MOTORS {
+                out[ch] = logical[i];
+            }
         }
         out
     }

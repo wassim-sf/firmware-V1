@@ -25,7 +25,6 @@ mod ahrs;
 mod baro;
 mod compass;
 mod crsf;
-mod dshot;
 mod ekf;
 mod esc;
 mod esc_telem;
@@ -36,6 +35,7 @@ mod imu;
 mod mavlink;
 mod mtf01;
 mod nav;
+mod pwm;
 mod tfluna;
 
 use panic_halt as _;
@@ -68,8 +68,8 @@ mod app {
     use crate::compass::{Compass, MagCal, MagData, MagRotation};
     use crate::crsf::{CrsfParser, RcChannels};
     use crate::ekf::{Ekf, NavSolution};
-    use crate::dshot;
     use crate::esc::{Esc, EscTelemetry};
+    use crate::pwm::MotorPwm;
     use crate::esc_telem::EscTelemParser;
     use crate::estimator::{Estimator, Rotation};
     use crate::filters::ImuLpf;
@@ -77,7 +77,8 @@ mod app {
     use crate::imu::{Health, Imu, ImuOut};
     use crate::mavlink::{
         DecodeDiag, Decoder, Encoder, Inbound, MAV_SYS_STATUS_SENSOR_3D_ACCEL,
-        MAV_SYS_STATUS_SENSOR_3D_GYRO, MAV_CMD_DO_MOTOR_TEST,
+        MAV_SYS_STATUS_SENSOR_3D_GYRO, MAV_SYS_STATUS_SENSOR_3D_MAG,
+        MAV_SYS_STATUS_SENSOR_GPS, MAV_CMD_DO_MOTOR_TEST,
     };
     use crate::mtf01::{Mtf01Data, MspParser};
     use crate::nav::{Nav, NavState};
@@ -160,11 +161,13 @@ mod app {
         accel_w: [f32; 3],
         /// Fused navigation solution, published by the EKF task.
         navsol: NavSolution,
-        /// ESC controller: config, motor-test state, DShot command queue. Mutated
-        /// by the USB command path, read by `dshot_task`.
+        /// ESC controller: PWM config, calibration + motor-test state. Mutated by
+        /// the USB command path, read by `pwm_task`.
         esc: Esc,
         /// Latest ESC telemetry, published by the USART3 RX interrupt.
         esc_tlm: EscTelemetry,
+        /// Pack voltage / cell count / charge %, published by `battery_task`.
+        battery: Battery,
     }
 
     #[local]
@@ -206,6 +209,11 @@ mod app {
         esc_tx_parser: EscTelemParser,
         // Inbound MAVLink command decoder, owned by `usb_task`.
         decoder: Decoder,
+        // Hardware TIM2 PWM output for the four analog ESCs, owned by `pwm_task`.
+        motor_pwm: MotorPwm,
+        // ADC1 + VBAT analog pin, owned by `battery_task`.
+        adc1: Adc1,
+        vbat_pin: VbatPin,
     }
 
     #[init]
@@ -235,9 +243,9 @@ mod app {
         ccdr.peripheral.kernel_spi123_clk_mux(Spi123ClkSel::Per);
 
         // --- Cycle counter + Systick monotonic -----------------------------
-        // DShot bit-banging needs precise sub-microsecond timing. `asm::delay`
-        // is only "at least N cycles", so enable DWT CYCCNT and let dshot.rs
-        // schedule edges against the actual core cycle counter.
+        // Enable the DWT cycle counter (used by bench timing / probe-rs); the
+        // motor output is now hardware PWM (see `pwm.rs`) and no longer depends on
+        // it, but keeping it on is free and useful for profiling.
         cp.DCB.enable_trace();
         cp.DWT.enable_cycle_counter();
         Mono::start(cp.SYST, 64_000_000);
@@ -408,11 +416,41 @@ mod app {
         let (_esc_tx_tx, mut esc_tx_rx) = serial3.split();
         esc_tx_rx.listen();
 
-        // --- Motor outputs: bit-banged DShot on PA0..PA3 (M1..M4) -----------
-        // Confirmed against the DAKEFPVH743 hwdef: M1..M4 = PA0..PA3 (TIM2). This
-        // firmware drives them as plain GPIO (bit-bang). Pins idle low; nothing
-        // spins until the ground station enables the ESC master switch.
-        dshot::init_pins();
+        // --- Motor outputs: hardware PWM on PA0..PA3 (M1..M4) ---------------
+        // Confirmed against the DAKEFPVH743 hwdef: M1..M4 = PA0..PA3 = TIM2
+        // CH1..CH4 (AF1). Analog ESCs take standard servo PWM, so one general
+        // purpose timer drives all four. The carrier frequency is fixed at init
+        // from the ESC config default (50 Hz); a runtime pwm_hz change is echoed
+        // to the GS but only takes effect on the next boot. Idle (min pulse) is
+        // emitted continuously; nothing spins until a motor test / master enable.
+        let motor_pwm = MotorPwm::new(
+            dp.TIM2,
+            (
+                gpioa.pa0.into_alternate::<1>(),
+                gpioa.pa1.into_alternate::<1>(),
+                gpioa.pa2.into_alternate::<1>(),
+                gpioa.pa3.into_alternate::<1>(),
+            ),
+            ccdr.peripheral.TIM2,
+            crate::esc::EscConfig::new().pwm_hz,
+            &ccdr.clocks,
+        );
+
+        // --- Battery voltage sense: ADC1 on PC0 (VBAT divider) --------------
+        // f_adc 4 MHz (per_ck / prescaler, well under the 50 MHz max), 16-bit.
+        // The ADC boot calibration needs a short DelayUs; SysTick is owned by the
+        // monotonic, so use the cycle-count `AsmDelay`.
+        let mut adc_delay = AsmDelay;
+        let mut adc1 = adc::Adc::adc1(
+            dp.ADC1,
+            4.MHz(),
+            &mut adc_delay,
+            ccdr.peripheral.ADC12,
+            &ccdr.clocks,
+        )
+        .enable();
+        adc1.set_resolution(adc::Resolution::SixteenBit);
+        let vbat_pin = gpioc.pc0.into_analog();
 
         // --- USB CDC-ACM  (OTG2_FS internal full-speed PHY, PA11/PA12) ------
         let usb = USB2::new(
@@ -460,7 +498,8 @@ mod app {
         nav_task::spawn().ok();
         ekf_task::spawn().ok();
         usb_task::spawn().ok();
-        dshot_task::spawn().ok();
+        pwm_task::spawn().ok();
+        battery_task::spawn().ok();
 
         (
             Shared {
@@ -485,6 +524,7 @@ mod app {
                 navsol: NavSolution::default(),
                 esc: Esc::new(),
                 esc_tlm: EscTelemetry::new(),
+                battery: Battery::default(),
             },
             Local {
                 imu1,
@@ -513,6 +553,9 @@ mod app {
                 esc_tx_rx,
                 esc_tx_parser: EscTelemParser::new(),
                 decoder: Decoder::new(),
+                motor_pwm,
+                adc1,
+                vbat_pin,
             },
         )
     }
@@ -697,10 +740,10 @@ mod app {
 
     /// USART3 RX interrupt — BLHeli32 / KISS ESC telemetry on the T pad. Decodes
     /// 10-byte CRC-checked records and stores them round-robin into `esc_tlm`.
-    #[task(binds = USART3, priority = 4, local = [esc_tx_rx, esc_tx_parser], shared = [esc, esc_tlm])]
+    #[task(binds = USART3, priority = 4, local = [esc_tx_rx, esc_tx_parser], shared = [esc_tlm])]
     fn usart3_rx(mut cx: usart3_rx::Context) {
         let parser = cx.local.esc_tx_parser;
-        let poles = cx.shared.esc.lock(|e| e.config.pole_count);
+        let poles = crate::esc::DEFAULT_POLE_COUNT;
         while let Ok(byte) = cx.local.esc_tx_rx.read() {
             if let Some(frame) = parser.push(byte) {
                 cx.shared.esc_tlm.lock(|t| t.ingest(frame, poles));
@@ -708,19 +751,34 @@ mod app {
         }
     }
 
-    /// Bit-banged DShot output. Builds the four frames from the ESC controller
-    /// (honouring the master interlock + motor-test timeout) and clocks them out
-    /// at the configured refresh rate. Priority 1 so the IMU sampling (prio 3) and
-    /// estimator (prio 2) always preempt the ~tens-of-µs bit-bang burst.
-    #[task(priority = 1, shared = [esc])]
-    async fn dshot_task(mut cx: dshot_task::Context) {
+    /// Hardware-PWM motor output. The TIM2 timer generates the servo waveform on
+    /// PA0..PA3 continuously; this task only recomputes each channel's pulse from
+    /// the ESC controller (master interlock, calibration routine, motor-test
+    /// timeout, throttle ramp + motor remap) and writes the compare registers.
+    /// Runs at a fixed 200 Hz for a smooth ramp and responsive watchdog,
+    /// independent of the PWM carrier frequency. Priority 1 so IMU sampling
+    /// (prio 3) and the estimator (prio 2) always preempt it.
+    #[task(priority = 1, local = [motor_pwm], shared = [esc])]
+    async fn pwm_task(mut cx: pwm_task::Context) {
         loop {
             let now = Mono::now().ticks() as u32;
-            let (frames, proto, refresh) =
-                cx.shared.esc.lock(|e| (e.frames(now), e.config.protocol, e.config.refresh_hz));
-            dshot::send_frames(&frames, proto);
-            let period_ms = (1000 / u32::from(refresh).max(1)).max(1);
-            Mono::delay(period_ms.millis()).await;
+            let pulses = cx.shared.esc.lock(|e| e.pulses(now));
+            for (ch, &us) in pulses.iter().enumerate() {
+                cx.local.motor_pwm.set_pulse_us(ch, us);
+            }
+            Mono::delay(5u32.millis()).await;
+        }
+    }
+
+    /// Battery monitor — reads the VBAT ADC at 5 Hz and publishes pack voltage,
+    /// detected cell count and voltage-based charge %. Priority 1; the one-shot
+    /// conversion is a few microseconds.
+    #[task(priority = 1, local = [adc1, vbat_pin], shared = [battery])]
+    async fn battery_task(mut cx: battery_task::Context) {
+        loop {
+            let raw: u32 = cx.local.adc1.read(cx.local.vbat_pin).unwrap_or(0);
+            cx.shared.battery.lock(|b| b.update(raw));
+            Mono::delay(200u32.millis()).await;
         }
     }
 
@@ -741,6 +799,12 @@ mod app {
 
         let mut n: u32 = 0;
         loop {
+            // Auto-recover a compass that was wired after boot (or briefly lost):
+            // if nothing was detected, re-probe both addresses once a second so it
+            // comes up without needing a firmware restart.
+            if compass.kind() == crate::compass::MagKind::None && n % 100 == 0 {
+                compass.init(i2c2);
+            }
             let m = compass.read(i2c2);
             mag.lock(|x| *x = m);
             if n % 5 == 0 {
@@ -844,7 +908,7 @@ mod app {
     /// Owns the whole USB stack: polls it at ~1 kHz (keeps enumeration alive and
     /// flushes the IN endpoint) and streams MAVLink 2 telemetry. Lowest
     /// priority, so it can never delay the IMU sampling tasks.
-    #[task(priority = 1, local = [usb_dev, serial, mavlink, decoder], shared = [out1, out2, gps, mag, att, flow, rc, navs, baro, prox_left, prox_right, navsol, esc, esc_tlm])]
+    #[task(priority = 1, local = [usb_dev, serial, mavlink, decoder], shared = [out1, out2, gps, mag, att, flow, rc, navs, baro, prox_left, prox_right, navsol, esc, esc_tlm, battery])]
     async fn usb_task(cx: usb_task::Context) {
         let usb_dev = cx.local.usb_dev;
         let serial = cx.local.serial;
@@ -865,12 +929,14 @@ mod app {
             mut navsol,
             mut esc,
             mut esc_tlm,
+            mut battery,
             ..
         } = cx.shared;
 
         let mut tick: u32 = 0;
         let mut boot_announces_left: u8 = 12;
         let mut last_rx_diag_ms: u32 = 0;
+        let mut last_gps_sent_diag: u32 = 0;
         loop {
             // Service the USB stack every tick (~1 ms). Decode any host->device
             // bytes as inbound MAVLink commands so the OUT endpoint never stalls.
@@ -890,11 +956,11 @@ mod app {
                                 Inbound::MotorTest { motor, throttle, .. } => {
                                     let _ = write!(ack, "ESC: motor {} test {}%", motor, *throttle as i32);
                                 }
-                                Inbound::EscSet { master_enabled, protocol, refresh_hz, .. } => {
+                                Inbound::EscSet { master_enabled, pwm_hz, .. } => {
                                     let _ = write!(
                                         ack,
-                                        "ESC: set master={} proto={} hz={}",
-                                        *master_enabled as u8, protocol, refresh_hz
+                                        "ESC: set master={} hz={}",
+                                        *master_enabled as u8, pwm_hz
                                     );
                                 }
                                 Inbound::EscCmd { target, command } => {
@@ -921,8 +987,8 @@ mod app {
                             if is_set || is_motor_test {
                                 let c = esc.lock(|e| e.config);
                                 let cf = mavlink.esc_config(
-                                    c.cur_scale, c.cur_offset, c.refresh_hz, c.protocol.as_u8(),
-                                    c.master_enabled, c.bidir, c.dir_mask, c.pole_count, c.mode3d_mask,
+                                    c.cur_scale, c.cur_offset, c.min_us, c.max_us,
+                                    c.pwm_hz, c.output_map, c.master_enabled,
                                 );
                                 pump_write(usb_dev, serial, cf.as_slice());
                             }
@@ -1199,13 +1265,11 @@ mod app {
                 let frame = mavlink.esc_config(
                     c.cur_scale,
                     c.cur_offset,
-                    c.refresh_hz,
-                    c.protocol.as_u8(),
+                    c.min_us,
+                    c.max_us,
+                    c.pwm_hz,
+                    c.output_map,
                     c.master_enabled,
-                    c.bidir,
-                    c.dir_mask,
-                    c.pole_count,
-                    c.mode3d_mask,
                 );
                 pump_write(usb_dev, serial, frame.as_slice());
             }
@@ -1216,10 +1280,16 @@ mod app {
             }
             if tick % 500 == 125 {
                 let now = Mono::now().ticks() as u32;
-                let (master, active) = esc.lock(|e| (e.config.master_enabled, e.active_test(now)));
+                let (master, active, cal) =
+                    esc.lock(|e| (e.config.master_enabled, e.active_test(now), e.cal_status()));
                 let mut s: heapless::String<50> = heapless::String::new();
-                if let Some((motor, value, remaining)) = active {
-                    let _ = write!(s, "ESC out master={} m{} dshot={} rem={}", master as u8, motor, value, remaining);
+                if let Some(is_max) = cal {
+                    // Range-teach in progress: report which endpoint is on the wire so
+                    // the operator can confirm the FC is actually holding it.
+                    let (label, us) = if is_max { ("MAX", 2000) } else { ("MIN", 1000) };
+                    let _ = write!(s, "ESC CAL {} out={}us master={}", label, us, master as u8);
+                } else if let Some((motor, value, remaining)) = active {
+                    let _ = write!(s, "ESC out master={} m{} us={} rem={}", master as u8, motor, value, remaining);
                 } else {
                     let _ = write!(s, "ESC out master={} idle", master as u8);
                 }
@@ -1236,8 +1306,67 @@ mod app {
                 let h1 = out1.lock(|o| o.health);
                 let h2 = out2.lock(|o| o.health);
                 let any_ok = matches!(h1, Health::Ok(_)) || matches!(h2, Health::Ok(_));
-                let sensors = MAV_SYS_STATUS_SENSOR_3D_ACCEL | MAV_SYS_STATUS_SENSOR_3D_GYRO;
-                let frame = mavlink.sys_status(sensors, if any_ok { sensors } else { 0 });
+                let imu_bits = MAV_SYS_STATUS_SENSOR_3D_ACCEL | MAV_SYS_STATUS_SENSOR_3D_GYRO;
+                // Compass: present when a chip was detected, healthy when reading.
+                let (mag_present, mag_ok) = mag.lock(|m| {
+                    (m.kind != crate::compass::MagKind::None, m.healthy)
+                });
+                // GPS: present when NMEA is arriving, healthy on a 3D fix.
+                let g = gps.lock(|x| *x);
+                let gps_present = g.sentences > 0;
+                let gps_ok = g.fix_type >= 3;
+                let mut present = imu_bits;
+                let mut health = if any_ok { imu_bits } else { 0 };
+                if mag_present {
+                    present |= MAV_SYS_STATUS_SENSOR_3D_MAG;
+                }
+                if mag_ok {
+                    health |= MAV_SYS_STATUS_SENSOR_3D_MAG;
+                }
+                if gps_present {
+                    present |= MAV_SYS_STATUS_SENSOR_GPS;
+                }
+                if gps_ok {
+                    health |= MAV_SYS_STATUS_SENSOR_GPS;
+                }
+                let b = battery.lock(|x| *x);
+                let frame = mavlink.sys_status(
+                    present,
+                    health,
+                    b.millivolts(),
+                    -1, // battery current: no live current sensor wired yet
+                    b.remaining_pct(),
+                );
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            // GPS + magnetometer liveness diagnostic (1 Hz). Shows up in the ground
+            // station log regardless of GPS fix, so a wired-but-unlocked GPS and a
+            // detected/undetected compass are both visible while debugging:
+            //   gps rx=1  -> NMEA sentences are arriving (wiring/baud OK)
+            //   sat/fix   -> lock progress (fix stays 0 indoors even when wired)
+            //   MAG none  -> nothing answered on I2C 0x0D/0x1E (wiring/address)
+            if tick % 1000 == 12 {
+                let g = gps.lock(|x| *x);
+                let m = mag.lock(|x| *x);
+                let gps_rx = g.sentences != last_gps_sent_diag;
+                last_gps_sent_diag = g.sentences;
+                let field = libm::sqrtf(
+                    m.field[0] * m.field[0] + m.field[1] * m.field[1] + m.field[2] * m.field[2],
+                );
+                let mag_state = if m.kind == crate::compass::MagKind::None {
+                    "none"
+                } else if m.healthy {
+                    "ok"
+                } else {
+                    "err"
+                };
+                let mut s: heapless::String<50> = heapless::String::new();
+                let _ = write!(
+                    s,
+                    "GPS rx={} sat={} fix={}|MAG {} {} {:.2}",
+                    gps_rx as u8, g.sats, g.fix_type, m.kind.name(), mag_state, field
+                );
+                let frame = mavlink.statustext(6, &s);
                 pump_write(usb_dev, serial, frame.as_slice());
             }
             if tick % 1000 == 15 {
@@ -1292,31 +1421,34 @@ mod app {
                 e.start_test(motor, throttle, timeout_ms, now_ms)
             }
             Inbound::EscSet {
-                master_enabled,
-                protocol,
-                refresh_hz,
-                bidir,
-                dir_mask,
-                mode3d_mask,
-                pole_count,
                 cur_scale,
                 cur_offset,
+                min_us,
+                max_us,
+                pwm_hz,
+                output_map,
+                master_enabled,
             } => {
                 e.apply_set(
                     master_enabled,
-                    protocol,
-                    refresh_hz,
-                    bidir,
-                    dir_mask,
-                    mode3d_mask,
-                    pole_count,
+                    pwm_hz,
+                    min_us,
+                    max_us,
+                    output_map,
                     cur_scale,
                     cur_offset,
                 );
                 true
             }
             Inbound::EscCmd { target, command } => {
-                e.queue_command(target, command);
+                use crate::esc::{CMD_CAL_MAX, CMD_CAL_MIN, CMD_STOP_ALL};
+                match command {
+                    CMD_CAL_MAX => e.cal_hold_max(now_ms),
+                    CMD_CAL_MIN => e.cal_hold_min(now_ms),
+                    CMD_STOP_ALL => e.stop_all(),
+                    _ => e.stop_calibration(),
+                }
+                let _ = target;
                 true
             }
         }

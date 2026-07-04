@@ -22,34 +22,30 @@
       <field type="uint8_t[4]" name="error_count">ESC error / desync count per motor.</field>
     </message>
     <message id="42011" name="SCKY_ESC_CONFIG">
-      <description>Live ESC configuration echoed by the FC. crc_extra=55.</description>
+      <description>Live analog-PWM ESC configuration echoed by the FC. crc_extra=33.</description>
       <field type="float" name="cur_scale">Analog current-sense scale (C pad).</field>
       <field type="float" name="cur_offset" units="mV">Analog current-sense offset (C pad).</field>
-      <field type="uint16_t" name="refresh_hz" units="Hz">DShot output refresh rate.</field>
-      <field type="uint8_t" name="protocol">0=DSHOT150, 1=DSHOT300, 2=DSHOT600.</field>
+      <field type="uint16_t[4]" name="min_us" units="us">Per-motor minimum throttle pulse (idle), microseconds.</field>
+      <field type="uint16_t[4]" name="max_us" units="us">Per-motor maximum throttle pulse (full), microseconds.</field>
+      <field type="uint16_t" name="pwm_hz" units="Hz">PWM carrier frequency; applied at boot.</field>
+      <field type="uint8_t[4]" name="output_map">Motor order: logical motor i drives physical output output_map[i] (0..3 = PA0..PA3).</field>
       <field type="uint8_t" name="master_enabled" enum="MAV_BOOL">Master output enable (the arm).</field>
-      <field type="uint8_t" name="bidir" enum="MAV_BOOL">Bidirectional-DShot request flag.</field>
-      <field type="uint8_t" name="dir_mask" display="bitmask">Bit per motor: 1 = reversed.</field>
-      <field type="uint8_t" name="pole_count">Motor magnetic pole count (eRPM-&gt;RPM).</field>
-      <field type="uint8_t" name="mode3d_mask" display="bitmask">Bit per motor: 1 = 3D mode on.</field>
     </message>
     <message id="42012" name="SCKY_ESC_SET">
-      <description>Write the live ESC configuration (ground station -&gt; FC). Same fields as SCKY_ESC_CONFIG. crc_extra=8.</description>
+      <description>Write the live analog-PWM ESC configuration (ground station -&gt; FC). Same fields as SCKY_ESC_CONFIG. crc_extra=154.</description>
       <field type="float" name="cur_scale">Analog current-sense scale (C pad).</field>
       <field type="float" name="cur_offset" units="mV">Analog current-sense offset (C pad).</field>
-      <field type="uint16_t" name="refresh_hz" units="Hz">DShot output refresh rate.</field>
-      <field type="uint8_t" name="protocol">0=DSHOT150, 1=DSHOT300, 2=DSHOT600.</field>
+      <field type="uint16_t[4]" name="min_us" units="us">Per-motor minimum throttle pulse (idle), microseconds.</field>
+      <field type="uint16_t[4]" name="max_us" units="us">Per-motor maximum throttle pulse (full), microseconds.</field>
+      <field type="uint16_t" name="pwm_hz" units="Hz">PWM carrier frequency; applied at boot.</field>
+      <field type="uint8_t[4]" name="output_map">Motor order: logical motor i drives physical output output_map[i] (0..3 = PA0..PA3).</field>
       <field type="uint8_t" name="master_enabled" enum="MAV_BOOL">Master output enable (the arm).</field>
-      <field type="uint8_t" name="bidir" enum="MAV_BOOL">Bidirectional-DShot request flag.</field>
-      <field type="uint8_t" name="dir_mask" display="bitmask">Bit per motor: 1 = reversed.</field>
-      <field type="uint8_t" name="pole_count">Motor magnetic pole count (eRPM-&gt;RPM).</field>
-      <field type="uint8_t" name="mode3d_mask" display="bitmask">Bit per motor: 1 = 3D mode on.</field>
     </message>
     <message id="42013" name="SCKY_ESC_CMD">
-      <description>One-shot DShot special command (ground station -&gt; FC). crc_extra=106.</description>
+      <description>One-shot ESC action (ground station -&gt; FC). crc_extra=106.</description>
       <field type="uint16_t" name="value">Reserved (0).</field>
       <field type="uint8_t" name="target">0 = all motors, 1..4 = a single motor.</field>
-      <field type="uint8_t" name="command">DShot command number (1..5 beacon, 9/10 3D off/on, 12 save, 20/21 spin normal/reversed).</field>
+      <field type="uint8_t" name="command">Action: 1 = start throttle-range calibration, 2 = stop calibration, 3 = stop all.</field>
     </message>
   </messages>
 </mavlink>

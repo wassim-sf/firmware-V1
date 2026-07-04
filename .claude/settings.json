@@ -36,7 +36,16 @@
       "Bash(arm-none-eabi-objcopy -O binary target/thumbv7em-none-eabihf/release/h743_esc_alltest h743_esc_alltest.bin)",
       "Bash(awk '{printf \"SP=0x%s reset=0x%s\\\\n\",$1,$2}')",
       "Bash(python3 -c \"print\\('DShot', 48 + \\(1999*12\\)//100, '=>', round\\(\\(48 + \\(1999*12\\)//100\\)/2047*100,1\\), '% of full'\\)\")",
-      "Bash(dfu-util -l)"
+      "Bash(dfu-util -l)",
+      "Bash(python3 -c \"import pymavlink; print\\('pymavlink', pymavlink.__file__\\)\")",
+      "Bash(python3 /tmp/claude-1000/-home-poorcsky-Documents-scky-firmware/3c6a34ff-c396-4f0b-9152-6ff5c7a93e67/scratchpad/crc.py)",
+      "Bash(npx tsc *)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(command -v nodejs)",
+      "Bash(grep -nA0 \"last_rx_diag_ms\")",
+      "Bash(python3 -c \"import json;d=json.load\\(open\\('arducopter.apj'\\)\\);print\\({k:d[k] for k in d if k!='image'}\\)\")",
+      "Bash(grep -n \"escStopAll\\(\\)\\\\|escCommand\\(target\\\\|^  start\\(\\)\\\\|^export const bus\\\\|  escCalibrate\\\\|notify\\(\\)$\" src/system/telemetry.ts)",
+      "Bash(grep -rn \"voltage: 0, current\\\\|percent: 0\\\\|battery: {\" src/system/telemetry.ts)"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"
