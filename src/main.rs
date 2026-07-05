@@ -47,6 +47,65 @@ use rtic_monotonics::systick::prelude::*;
 // 1 kHz Systick monotonic drives every periodic task.
 systick_monotonic!(Mono, 1000);
 
+// ---------------------------------------------------------------------------
+// Software DFU entry — reboot into the STM32 ROM bootloader on request, so the
+// ground station can flash new firmware over USB without ever touching BOOT0.
+//
+// `reboot_to_bootloader` stamps a magic word into an *uninitialised* RAM cell
+// (preserved across a warm reset and NOT zeroed by startup) and system-resets.
+// The very first thing `init` does is call `dfu_check_and_jump`, before any clock
+// or peripheral is configured: if the magic is present it is cleared (so a failed
+// jump self-recovers on the next power-cycle) and the CPU jumps to the system
+// bootloader from the near-reset state. If the jump ever fails, BOOT0 still works.
+// ---------------------------------------------------------------------------
+use core::mem::MaybeUninit;
+
+const DFU_MAGIC: u32 = 0xB007_DF00;
+/// STM32H743 system-memory (ROM) bootloader entry point.
+const SYSTEM_BOOTLOADER_ADDR: u32 = 0x1FF0_9800;
+
+/// Uninitialised RAM cell — survives a warm reset; `.uninit` is not zeroed by the
+/// cortex-m-rt startup, so the magic written before the reset is still here after.
+#[link_section = ".uninit.DFU_FLAG"]
+static mut DFU_FLAG: MaybeUninit<u32> = MaybeUninit::uninit();
+
+/// Request a reboot into the ROM DFU bootloader: stamp the magic and system-reset.
+/// The jump itself happens in [`dfu_check_and_jump`] at the top of `init`.
+pub fn reboot_to_bootloader() -> ! {
+    unsafe {
+        core::ptr::addr_of_mut!(DFU_FLAG)
+            .cast::<u32>()
+            .write_volatile(DFU_MAGIC);
+    }
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
+/// Called first thing in `init`. If the DFU magic is set, clear it and jump to the
+/// system bootloader from the (still near-reset) state.
+///
+/// # Safety
+/// Reads/writes the raw bootloader vectors and rewrites the stack pointer; must run
+/// before any peripheral, clock, or interrupt is configured.
+unsafe fn dfu_check_and_jump() {
+    let cell = core::ptr::addr_of_mut!(DFU_FLAG).cast::<u32>();
+    if cell.read_volatile() != DFU_MAGIC {
+        return;
+    }
+    cell.write_volatile(0); // one-shot; a bad jump recovers on next power-cycle
+    cortex_m::interrupt::disable();
+    let sp = core::ptr::read_volatile(SYSTEM_BOOTLOADER_ADDR as *const u32);
+    let entry = core::ptr::read_volatile((SYSTEM_BOOTLOADER_ADDR + 4) as *const u32);
+    // Set the bootloader's stack pointer and branch to its reset vector in one asm
+    // block (the reset vector already carries the Thumb bit, so `bx` is correct).
+    core::arch::asm!(
+        "msr msp, {sp}",
+        "bx {entry}",
+        sp = in(reg) sp,
+        entry = in(reg) entry,
+        options(noreturn),
+    );
+}
+
 #[rtic::app(
     device = stm32h7xx_hal::pac,
     peripherals = true,
@@ -63,7 +122,7 @@ mod app {
     use stm32h7xx_hal::prelude::*;
     use stm32h7xx_hal::rcc::rec::{AdcClkSel, Adc12, Spi123ClkSel, UsbClkSel};
     use stm32h7xx_hal::rcc::CoreClocks;
-    use stm32h7xx_hal::serial::{self, Rx};
+    use stm32h7xx_hal::serial::Rx;
     use stm32h7xx_hal::usb_hs::{UsbBus, USB2};
     use stm32h7xx_hal::{i2c, pac, spi};
     use usb_device::prelude::*;
@@ -245,6 +304,10 @@ mod app {
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local) {
+        // Before anything else: if the ground station asked for a DFU reboot, jump
+        // straight to the ROM bootloader (never returns). Must precede all setup.
+        unsafe { super::dfu_check_and_jump() };
+
         let dp: pac::Peripherals = cx.device;
         let mut cp = cx.core;
 
@@ -393,19 +456,18 @@ mod app {
         let (_crsf_tx, mut crsf_rx) = serial5.split();
         crsf_rx.listen();
 
-        // --- USART6 -> TF-Luna LEFT side lidar  (T6/PC6 + R6/PC7) ----------
-        // The lidar is wired straight-through: its TX lands on the T6 pad (PC6),
-        // which is normally USART6_TX. We enable the peripheral's SWAP bit so RX
-        // is taken from PC6 and TX from PC7 — i.e. the FC reads the lidar on T6.
-        // With SWAP on, the pull-up belongs on the now-RX pin PC6.
+        // --- USART6 -> TF-Luna LEFT side lidar  (T6/PC6 TX, R6/PC7 RX) -----
+        // Standard wiring: the lidar's TX lands on the R6 pad (PC7 = USART6_RX),
+        // so no SWAP is needed and the pull-up belongs on the RX pin PC7 (same
+        // shape as the right lidar on UART7). PC6 stays TX (unused by the lidar).
         let serial6 = dp
             .USART6
             .serial(
                 (
-                    gpioc.pc6.into_alternate::<7>().internal_pull_up(true),
-                    gpioc.pc7.into_alternate::<7>(),
+                    gpioc.pc6.into_alternate::<7>(),
+                    gpioc.pc7.into_alternate::<7>().internal_pull_up(true),
                 ),
-                serial::config::Config::new(TFLUNA_BAUD.bps()).swaptxrx(true),
+                TFLUNA_BAUD.bps(),
                 ccdr.peripheral.USART6,
                 &ccdr.clocks,
             )
@@ -1063,6 +1125,7 @@ mod app {
         let mut boot_announces_left: u8 = 12;
         let mut last_rx_diag_ms: u32 = 0;
         let mut last_gps_sent_diag: u32 = 0;
+        let mut last_rc_frames_diag: u32 = 0;
         loop {
             // Service the USB stack every tick (~1 ms). Decode any host->device
             // bytes as inbound MAVLink commands so the OUT endpoint never stalls.
@@ -1091,6 +1154,32 @@ mod app {
                                 }
                                 Inbound::EscCmd { target, command } => {
                                     let _ = write!(ack, "ESC: cmd {} -> tgt {}", command, target);
+                                }
+                                Inbound::Reboot { to_bootloader } => {
+                                    let _ = write!(
+                                        ack,
+                                        "REBOOT {}",
+                                        if *to_bootloader { "-> DFU BOOTLOADER" } else { "app" }
+                                    );
+                                }
+                            }
+                            // Reboot is handled here (it never returns): ack the
+                            // command, flush USB so the ground station sees it, then
+                            // reset — into the ROM bootloader for a DFU update, or a
+                            // plain application restart.
+                            if let Inbound::Reboot { to_bootloader } = &cmd {
+                                let to_bootloader = *to_bootloader;
+                                let frame = mavlink.statustext(6, &ack);
+                                pump_write(usb_dev, serial, frame.as_slice());
+                                // ~50 ms of polling to drain the IN endpoint first.
+                                for _ in 0..50 {
+                                    usb_dev.poll(&mut [serial]);
+                                    cortex_m::asm::delay(64_000);
+                                }
+                                if to_bootloader {
+                                    super::reboot_to_bootloader();
+                                } else {
+                                    cortex_m::peripheral::SCB::sys_reset();
                                 }
                             }
                             let accepted = esc.lock(|e| apply_inbound(e, cmd, now));
@@ -1544,6 +1633,43 @@ mod app {
                 pump_write(usb_dev, serial, frame.as_slice());
             }
 
+            // TF-Luna RIGHT diagnostic STATUSTEXT at 2 Hz (same fields as LEFT), so
+            // both side lidars can be brought up independently on the bench.
+            if tick % 500 == 470 {
+                let r = prox_right.lock(|p| *p);
+                let mut s: heapless::String<50> = heapless::String::new();
+                let _ = write!(
+                    s,
+                    "R rx={} fr={} ck={} d={} a={}",
+                    r.rx_bytes, r.frames, r.checksum_errors, r.distance_cm, r.amplitude
+                );
+                let frame = mavlink.statustext(6, &s);
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+
+            // ExpressLRS / CRSF link diagnostic at 2 Hz. `up` means an RC frame
+            // arrived since the last check (link alive); `lq`/`rssi` are the CRSF
+            // LINK_STATISTICS uplink metrics; `thr`/`arm` echo two channel µs so
+            // wiggling the sticks visibly proves the receiver is connected.
+            if tick % 500 == 250 {
+                let r = rc.lock(|r| *r);
+                let up = r.frames != last_rc_frames_diag;
+                last_rc_frames_diag = r.frames;
+                let mut s: heapless::String<50> = heapless::String::new();
+                let _ = write!(
+                    s,
+                    "RC {} lq={} rssi=-{} fr={} thr={} arm={}",
+                    if up { "UP" } else { "--" },
+                    r.link_quality,
+                    r.rssi_dbm,
+                    r.frames,
+                    r.ch_us(2),
+                    r.ch_us(4),
+                );
+                let frame = mavlink.statustext(6, &s);
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+
             tick = tick.wrapping_add(1);
             Mono::delay(1.millis()).await;
         }
@@ -1595,6 +1721,9 @@ mod app {
                 let _ = target;
                 true
             }
+            // Reboot is intercepted in `usb_task` before this is called (it resets
+            // the MCU and never returns); this arm only keeps the match exhaustive.
+            Inbound::Reboot { .. } => true,
         }
     }
 

@@ -12,8 +12,8 @@
     stm32h7xx_hal :: gpio :: { Analog, Output, Pin, PC0, PC1, PD10 }; use
     stm32h7xx_hal :: prelude :: * ; use stm32h7xx_hal :: rcc :: rec ::
     { AdcClkSel, Adc12, Spi123ClkSel, UsbClkSel }; use stm32h7xx_hal :: rcc ::
-    CoreClocks; use stm32h7xx_hal :: serial :: { self, Rx }; use stm32h7xx_hal
-    :: usb_hs :: { UsbBus, USB2 }; use stm32h7xx_hal :: { i2c, pac, spi }; use
+    CoreClocks; use stm32h7xx_hal :: serial :: Rx; use stm32h7xx_hal :: usb_hs
+    :: { UsbBus, USB2 }; use stm32h7xx_hal :: { i2c, pac, spi }; use
     usb_device :: prelude :: * ; use crate :: ahrs :: Attitude; use crate ::
     baro :: { Baro, BaroData }; use crate :: battery :: Battery; use crate ::
     compass :: { Compass, MagCal, MagData, MagRotation }; use crate :: control
@@ -118,7 +118,7 @@
                     e.cal_hold_min(now_ms), CMD_STOP_ALL => e.stop_all(), _ =>
                     e.stop_calibration(),
                 } let _ = target; true
-            }
+            } Inbound :: Reboot { .. } => true,
         }
     } fn
     pump_write(usb_dev : & mut UsbDevice < 'static, MyUsbBus > , serial : &
@@ -223,10 +223,11 @@
     } #[inline(always)] #[allow(non_snake_case)] fn init(cx : init :: Context)
     -> (Shared, Local)
     {
-        let dp : pac :: Peripherals = cx.device; let mut cp = cx.core; let pwr
-        = dp.PWR.constrain(); let pwrcfg = pwr.freeze(); let rcc =
-        dp.RCC.constrain(); let mut ccdr = rcc.freeze(pwrcfg, & dp.SYSCFG);
-        let _ = ccdr.clocks.hsi48_ck().expect("HSI48 must be running");
+        unsafe { super :: dfu_check_and_jump() }; let dp : pac :: Peripherals
+        = cx.device; let mut cp = cx.core; let pwr = dp.PWR.constrain(); let
+        pwrcfg = pwr.freeze(); let rcc = dp.RCC.constrain(); let mut ccdr =
+        rcc.freeze(pwrcfg, & dp.SYSCFG); let _ =
+        ccdr.clocks.hsi48_ck().expect("HSI48 must be running");
         ccdr.peripheral.kernel_usb_clk_mux(UsbClkSel :: Hsi48);
         ccdr.peripheral.kernel_spi123_clk_mux(Spi123ClkSel :: Per);
         ccdr.peripheral.kernel_adc_clk_mux(AdcClkSel :: Per);
@@ -268,12 +269,11 @@
         CRSF_BAUD.bps(), ccdr.peripheral.UART5, & ccdr.clocks,).unwrap(); let
         (_crsf_tx, mut crsf_rx) = serial5.split(); crsf_rx.listen(); let
         serial6 =
-        dp.USART6.serial((gpioc.pc6.into_alternate :: < 7 >
-        ().internal_pull_up(true), gpioc.pc7.into_alternate :: < 7 > (),),
-        serial :: config :: Config :: new(TFLUNA_BAUD.bps()).swaptxrx(true),
-        ccdr.peripheral.USART6, & ccdr.clocks,).unwrap(); let
-        (_tfl_l_tx, mut tfl_left_rx) = serial6.split(); tfl_left_rx.listen();
-        let serial7 =
+        dp.USART6.serial((gpioc.pc6.into_alternate :: < 7 > (),
+        gpioc.pc7.into_alternate :: < 7 > ().internal_pull_up(true),),
+        TFLUNA_BAUD.bps(), ccdr.peripheral.USART6, & ccdr.clocks,).unwrap();
+        let (_tfl_l_tx, mut tfl_left_rx) = serial6.split();
+        tfl_left_rx.listen(); let serial7 =
         dp.UART7.serial((gpioe.pe8.into_alternate :: < 7 > (),
         gpioe.pe7.into_alternate :: < 7 > ().internal_pull_up(true),),
         TFLUNA_BAUD.bps(), ccdr.peripheral.UART7, & ccdr.clocks,).unwrap();
@@ -2188,7 +2188,7 @@
             esc, mut esc_tlm, mut battery, ..
         } = cx.shared; let mut tick : u32 = 0; let mut boot_announces_left :
         u8 = 12; let mut last_rx_diag_ms : u32 = 0; let mut last_gps_sent_diag
-        : u32 = 0; loop
+        : u32 = 0; let mut last_rc_frames_diag : u32 = 0; loop
         {
             usb_dev.poll(& mut [serial]);
             {
@@ -2218,7 +2218,23 @@
                                 {
                                     let _ = write!
                                     (ack, "ESC: cmd {} -> tgt {}", command, target);
+                                } Inbound :: Reboot { to_bootloader } =>
+                                {
+                                    let _ = write!
+                                    (ack, "REBOOT {}", if *to_bootloader { "-> DFU BOOTLOADER" }
+                                    else { "app" });
                                 }
+                            } if let Inbound :: Reboot { to_bootloader } = & cmd
+                            {
+                                let to_bootloader = * to_bootloader; let frame =
+                                mavlink.statustext(6, & ack);
+                                pump_write(usb_dev, serial, frame.as_slice()); for _ in 0 ..
+                                50
+                                {
+                                    usb_dev.poll(& mut [serial]); cortex_m :: asm ::
+                                    delay(64_000);
+                                } if to_bootloader { super :: reboot_to_bootloader(); } else
+                                { cortex_m :: peripheral :: SCB :: sys_reset(); }
                             } let accepted = esc.lock(| e | apply_inbound(e, cmd, now));
                             let frame = mavlink.statustext(6, & ack);
                             pump_write(usb_dev, serial, frame.as_slice()); if ! accepted
@@ -2506,6 +2522,25 @@
                 String < 50 > = heapless :: String :: new(); let _ = write!
                 (s, "L rx={} fr={} ck={} d={} a={}", l.rx_bytes, l.frames,
                 l.checksum_errors, l.distance_cm, l.amplitude); let frame =
+                mavlink.statustext(6, & s);
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 500 == 470
+            {
+                let r = prox_right.lock(| p | * p); let mut s : heapless ::
+                String < 50 > = heapless :: String :: new(); let _ = write!
+                (s, "R rx={} fr={} ck={} d={} a={}", r.rx_bytes, r.frames,
+                r.checksum_errors, r.distance_cm, r.amplitude); let frame =
+                mavlink.statustext(6, & s);
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 500 == 250
+            {
+                let r = rc.lock(| r | * r); let up = r.frames !=
+                last_rc_frames_diag; last_rc_frames_diag = r.frames; let mut s
+                : heapless :: String < 50 > = heapless :: String :: new(); let
+                _ = write!
+                (s, "RC {} lq={} rssi=-{} fr={} thr={} arm={}", if up { "UP" }
+                else { "--" }, r.link_quality, r.rssi_dbm, r.frames,
+                r.ch_us(2), r.ch_us(4),); let frame =
                 mavlink.statustext(6, & s);
                 pump_write(usb_dev, serial, frame.as_slice());
             } tick = tick.wrapping_add(1); Mono :: delay(1.millis()).await;

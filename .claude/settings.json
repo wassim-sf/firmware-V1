@@ -53,7 +53,9 @@
       "Bash(cargo size *)",
       "Bash(cargo clippy *)",
       "Bash(git checkout *)",
-      "Bash([ -f \"$EXP\" ])"
+      "Bash([ -f \"$EXP\" ])",
+      "Bash(bun run *)",
+      "Bash(grep -n \"match &cmd\\\\|let accepted = esc.lock\\(|e| apply_inbound\\\\|Inbound::EscCmd { target, command } =>\" src/main.rs)"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"

@@ -63,6 +63,10 @@ const CRC_SCKY_ESC_CMD: u8 = 106;
 /// `MAV_CMD_DO_MOTOR_TEST` command id used inside `COMMAND_LONG`.
 pub const MAV_CMD_DO_MOTOR_TEST: u16 = 209;
 
+/// `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` — reboot the FC. param1: 1 = reboot the
+/// application, 3 = reboot into the ROM (DFU) bootloader for firmware flashing.
+pub const MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN: u16 = 246;
+
 pub type Frame = Vec<u8, MAX_FRAME_LEN>;
 
 /// Stateful MAVLink encoder. Sequence numbers are shared by all messages on
@@ -621,6 +625,9 @@ pub enum Inbound {
     /// SCKY_ESC_CMD: one-shot ESC action. `target` 0 = all, 1..4 = one motor;
     /// `command` is an action code (see [`crate::esc`] `CMD_*`).
     EscCmd { target: u8, command: u16 },
+    /// MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN. `to_bootloader` = jump to the ROM DFU
+    /// bootloader (param1 == 3); otherwise a plain application reboot.
+    Reboot { to_bootloader: bool },
 }
 
 /// One-shot receive diagnostic from the streaming decoder.
@@ -827,17 +834,26 @@ impl Decoder {
         match self.msgid {
             MSG_COMMAND_LONG => {
                 let command = u16::from_le_bytes([p[28], p[29]]);
-                if command != MAV_CMD_DO_MOTOR_TEST {
-                    self.diag = Some(DecodeDiag::CommandLong { command });
-                    return None;
+                match command {
+                    MAV_CMD_DO_MOTOR_TEST => Some(Inbound::MotorTest {
+                        motor: f32_at(&p, 0) as u8,           // param1: motor instance
+                        throttle_type: f32_at(&p, 4) as u8,   // param2: throttle type
+                        throttle: f32_at(&p, 8),              // param3: throttle value
+                        timeout_s: f32_at(&p, 12),            // param4: timeout (s)
+                        count: f32_at(&p, 16) as u8,          // param5: motor count
+                    }),
+                    MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN => {
+                        // param1: 1 = reboot app, 3 = reboot to (DFU) bootloader.
+                        let param1 = f32_at(&p, 0);
+                        Some(Inbound::Reboot {
+                            to_bootloader: param1 as i32 == 3,
+                        })
+                    }
+                    _ => {
+                        self.diag = Some(DecodeDiag::CommandLong { command });
+                        None
+                    }
                 }
-                Some(Inbound::MotorTest {
-                    motor: f32_at(&p, 0) as u8,           // param1: motor instance
-                    throttle_type: f32_at(&p, 4) as u8,   // param2: throttle type
-                    throttle: f32_at(&p, 8),              // param3: throttle value
-                    timeout_s: f32_at(&p, 12),            // param4: timeout (s)
-                    count: f32_at(&p, 16) as u8,          // param5: motor count
-                })
             }
             MSG_SCKY_ESC_SET => Some(Inbound::EscSet {
                 cur_scale: f32_at(&p, 0),
