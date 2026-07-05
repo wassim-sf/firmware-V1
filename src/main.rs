@@ -23,6 +23,7 @@
 
 mod ahrs;
 mod baro;
+mod battery;
 mod compass;
 mod crsf;
 mod ekf;
@@ -54,10 +55,13 @@ mod app {
     use super::*;
 
     use core::fmt::Write as FmtWrite;
+    use embedded_hal::adc::OneShot;
     use embedded_hal::spi::MODE_3;
-    use stm32h7xx_hal::gpio::{Output, Pin};
+    use stm32h7xx_hal::adc;
+    use stm32h7xx_hal::gpio::{Analog, Output, Pin, PC0, PC1, PD10};
     use stm32h7xx_hal::prelude::*;
-    use stm32h7xx_hal::rcc::rec::{Spi123ClkSel, UsbClkSel};
+    use stm32h7xx_hal::rcc::rec::{AdcClkSel, Adc12, Spi123ClkSel, UsbClkSel};
+    use stm32h7xx_hal::rcc::CoreClocks;
     use stm32h7xx_hal::serial::{self, Rx};
     use stm32h7xx_hal::usb_hs::{UsbBus, USB2};
     use stm32h7xx_hal::{i2c, pac, spi};
@@ -65,6 +69,7 @@ mod app {
 
     use crate::ahrs::Attitude;
     use crate::baro::{Baro, BaroData};
+    use crate::battery::Battery;
     use crate::compass::{Compass, MagCal, MagData, MagRotation};
     use crate::crsf::{CrsfParser, RcChannels};
     use crate::ekf::{Ekf, NavSolution};
@@ -133,6 +138,16 @@ mod app {
 
     // The USB-C port wires to PA11/PA12 = OTG2_FS, i.e. the HAL's USB2.
     type MyUsbBus = UsbBus<USB2>;
+
+    /// Minimal `DelayUs` for the one-shot ADC boot calibration (SysTick is owned
+    /// by the RTIC monotonic, so the HAL SysTick `Delay` is unavailable here).
+    /// Busy-waits core cycles at the 64 MHz HSI clock.
+    struct AsmDelay;
+    impl embedded_hal::blocking::delay::DelayUs<u8> for AsmDelay {
+        fn delay_us(&mut self, us: u8) {
+            cortex_m::asm::delay(u32::from(us) * 64);
+        }
+    }
 
     #[shared]
     struct Shared {
@@ -211,9 +226,16 @@ mod app {
         decoder: Decoder,
         // Hardware TIM2 PWM output for the four analog ESCs, owned by `pwm_task`.
         motor_pwm: MotorPwm,
-        // ADC1 + VBAT analog pin, owned by `battery_task`.
-        adc1: Adc1,
-        vbat_pin: VbatPin,
+        // VBAT ADC pieces, consumed once by `battery_task` (which builds the ADC
+        // *after* USB is up so its blocking calibration can never stall boot).
+        vbat_adc: Option<pac::ADC1>,
+        vbat_prec: Option<Adc12>,
+        vbat_clocks: CoreClocks,
+        vbat_pin: PC0<Analog>,
+        vbat_pin2: PC1<Analog>,
+        // Blue on-board status LED (DAKEFPVH743 LED0 = PD10, active-low),
+        // heartbeat-blinked by `led_task` to show the firmware is alive.
+        status_led: PD10<Output>,
     }
 
     #[init]
@@ -241,6 +263,11 @@ mod app {
         // makes `SPI1.spi(...)` panic and halt before USB can enumerate.
         // `per_ck` is sourced from the running HSI clock and is always present.
         ccdr.peripheral.kernel_spi123_clk_mux(Spi123ClkSel::Per);
+
+        // ADC kernel clock: also `per_ck` (64 MHz HSI). Selecting the mux is a
+        // plain register write (no wait), safe in init. The ADC itself is brought
+        // up later, inside `battery_task`, after USB has enumerated.
+        ccdr.peripheral.kernel_adc_clk_mux(AdcClkSel::Per);
 
         // --- Cycle counter + Systick monotonic -----------------------------
         // Enable the DWT cycle counter (used by bench timing / probe-rs); the
@@ -436,21 +463,24 @@ mod app {
             &ccdr.clocks,
         );
 
-        // --- Battery voltage sense: ADC1 on PC0 (VBAT divider) --------------
-        // f_adc 4 MHz (per_ck / prescaler, well under the 50 MHz max), 16-bit.
-        // The ADC boot calibration needs a short DelayUs; SysTick is owned by the
-        // monotonic, so use the cycle-count `AsmDelay`.
-        let mut adc_delay = AsmDelay;
-        let mut adc1 = adc::Adc::adc1(
-            dp.ADC1,
-            4.MHz(),
-            &mut adc_delay,
-            ccdr.peripheral.ADC12,
-            &ccdr.clocks,
-        )
-        .enable();
-        adc1.set_resolution(adc::Resolution::SixteenBit);
+        // --- Battery voltage sense (VBAT) -----------------------------------
+        // Diagnostic phase: sample BOTH candidate pins so the `BAT` debug line
+        // can show which one actually tracks the pack — PC0 and PC1 are the stock
+        // DAKEFPVH743 ADC_CURR / ADC_VBAT pair and this custom board's wiring is
+        // still unconfirmed. Only configure the analog pins here (safe GPIO
+        // writes); the ADC device + rec/clocks are stashed and the actual ADC
+        // bring-up happens in `battery_task` once USB is enumerated (the HAL
+        // calibration busy-waits with no timeout, so it must never run in init).
         let vbat_pin = gpioc.pc0.into_analog();
+        let vbat_pin2 = gpioc.pc1.into_analog();
+        let vbat_adc = Some(dp.ADC1);
+        let vbat_prec = Some(ccdr.peripheral.ADC12);
+        let vbat_clocks = ccdr.clocks;
+
+        // Blue on-board status LED (LED0 = PD10, active-low). Start it off; the
+        // `led_task` heartbeat drives it once the scheduler is running.
+        let mut status_led = gpiod.pd10.into_push_pull_output();
+        status_led.set_high();
 
         // --- USB CDC-ACM  (OTG2_FS internal full-speed PHY, PA11/PA12) ------
         let usb = USB2::new(
@@ -500,6 +530,7 @@ mod app {
         usb_task::spawn().ok();
         pwm_task::spawn().ok();
         battery_task::spawn().ok();
+        led_task::spawn().ok();
 
         (
             Shared {
@@ -554,8 +585,12 @@ mod app {
                 esc_tx_parser: EscTelemParser::new(),
                 decoder: Decoder::new(),
                 motor_pwm,
-                adc1,
+                vbat_adc,
+                vbat_prec,
+                vbat_clocks,
                 vbat_pin,
+                vbat_pin2,
+                status_led,
             },
         )
     }
@@ -770,15 +805,65 @@ mod app {
         }
     }
 
-    /// Battery monitor — reads the VBAT ADC at 5 Hz and publishes pack voltage,
-    /// detected cell count and voltage-based charge %. Priority 1; the one-shot
-    /// conversion is a few microseconds.
-    #[task(priority = 1, local = [adc1, vbat_pin], shared = [battery])]
+    /// Battery monitor — brings up ADC1 and reads VBAT at 5 Hz, publishing pack
+    /// voltage / detected cell count / charge %.
+    ///
+    /// The ADC is initialised **here, not in `init`**, and only after a startup
+    /// delay: the HAL bring-up (`power_up`/`calibrate`/`enable`) busy-waits with no
+    /// timeout, so running it before USB enumerates could stall boot and hide the
+    /// board from the host. By the time this runs, USB is already up, so a stall
+    /// (e.g. a bad ADC clock) can never brick the link.
+    #[task(priority = 1, local = [vbat_adc, vbat_prec, vbat_clocks, vbat_pin, vbat_pin2], shared = [battery])]
     async fn battery_task(mut cx: battery_task::Context) {
+        Mono::delay(2000u32.millis()).await;
+        let mut delay = AsmDelay;
+        let dev = cx.local.vbat_adc.take().unwrap();
+        let prec = cx.local.vbat_prec.take().unwrap();
+        let mut adc = adc::Adc::adc1(dev, 4.MHz(), &mut delay, prec, cx.local.vbat_clocks).enable();
+        adc.set_resolution(adc::Resolution::SixteenBit);
+        // Long sample time (810.5 cycles). The VBAT divider is a high-impedance
+        // source; the HAL default (32.5 cycles) doesn't give the sample-and-hold
+        // cap time to charge, so a real pack can read near-0. Betaflight likewise
+        // uses a long sample time on the voltage channels.
+        adc.set_sample_time(adc::AdcSampleTime::T_810);
+        let pin0 = cx.local.vbat_pin;
+        let pin1 = cx.local.vbat_pin2;
         loop {
-            let raw: u32 = cx.local.adc1.read(cx.local.vbat_pin).unwrap_or(0);
-            cx.shared.battery.lock(|b| b.update(raw));
+            // Average 64 samples per pin — a single 16-bit conversion is noisy
+            // (the reading jumped ~10 % otherwise); the mean is rock-steady.
+            // Sample BOTH candidate pins until we've confirmed which one carries
+            // VBAT on this board (see the `BAT` debug STATUSTEXT).
+            let mut sum0: u32 = 0;
+            let mut sum1: u32 = 0;
+            for _ in 0..64 {
+                sum0 += adc.read(pin0).unwrap_or(0);
+                sum1 += adc.read(pin1).unwrap_or(0);
+            }
+            let raw0 = sum0 / 64;
+            let raw1 = sum1 / 64;
+            cx.shared.battery.lock(|b| {
+                b.raw_pc0 = raw0;
+                b.raw_pc1 = raw1;
+                // PC1 is the stock DAKEFPVH743 VBAT pin — use it for the live
+                // reading; flip to raw0 here if the debug line shows PC0 tracks
+                // the pack instead.
+                b.update(raw1);
+            });
             Mono::delay(200u32.millis()).await;
+        }
+    }
+
+    /// Blue status LED heartbeat — a short pulse once a second so it's obvious at
+    /// a glance the firmware is alive and the scheduler is running. LED0 (PD10)
+    /// is active-low on the DAKEFPVH743, so `set_low` lights it.
+    #[task(priority = 1, local = [status_led])]
+    async fn led_task(cx: led_task::Context) {
+        let led = cx.local.status_led;
+        loop {
+            led.set_low(); // on
+            Mono::delay(100u32.millis()).await;
+            led.set_high(); // off
+            Mono::delay(900u32.millis()).await;
         }
     }
 
@@ -1365,6 +1450,24 @@ mod app {
                     s,
                     "GPS rx={} sat={} fix={}|MAG {} {} {:.2}",
                     gps_rx as u8, g.sats, g.fix_type, m.kind.name(), mag_state, field
+                );
+                let frame = mavlink.statustext(6, &s);
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            // Battery calibration diagnostic (1 Hz): raw averaged ADC count, the
+            // voltage at the ADC pin, and the scaled pack voltage / cells / %.
+            // To calibrate: measure the real pack with a multimeter, then set
+            //   VBAT_SCALE_new = VBAT_SCALE_old * (multimeter_V / v=... shown here).
+            // TEMPORARY — remove once VBAT_SCALE is dialled in.
+            if tick % 1000 == 14 {
+                let b = battery.lock(|x| *x);
+                let pc0_v = b.raw_pc0 as f32 / 65535.0 * 3.3;
+                let pc1_v = b.raw_pc1 as f32 / 65535.0 * 3.3;
+                let mut s: heapless::String<50> = heapless::String::new();
+                let _ = write!(
+                    s,
+                    "BAT PC0 {:.3}v PC1 {:.3}v -> {:.2}V {}%",
+                    pc0_v, pc1_v, b.volts, b.percent
                 );
                 let frame = mavlink.statustext(6, &s);
                 pump_write(usb_dev, serial, frame.as_slice());

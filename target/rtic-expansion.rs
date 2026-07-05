@@ -8,15 +8,15 @@
     r" Holds the maximum priority level for use by async HAL drivers."]
     #[no_mangle] static RTIC_ASYNC_MAX_LOGICAL_PRIO : u8 = 3u8; use super :: *
     ; use core :: fmt :: Write as FmtWrite; use embedded_hal :: adc ::
-    OneShot; use embedded_hal :: spi :: MODE_3; use stm32h7xx_hal :: adc ::
-    { self, Adc }; use stm32h7xx_hal :: gpio :: { Analog, Output, Pin, PC0 };
-    use stm32h7xx_hal :: prelude :: * ; use stm32h7xx_hal :: rcc :: rec ::
-    { AdcClkSel, Spi123ClkSel, UsbClkSel }; use stm32h7xx_hal :: serial ::
-    { self, Rx }; use stm32h7xx_hal :: usb_hs :: { UsbBus, USB2 }; use
-    stm32h7xx_hal :: { i2c, pac, spi }; use usb_device :: prelude :: * ; use
-    crate :: ahrs :: Attitude; use crate :: baro :: { Baro, BaroData }; use
-    crate :: battery :: Battery; use crate :: compass ::
-    { Compass, MagCal, MagData, MagRotation }; use crate :: crsf ::
+    OneShot; use embedded_hal :: spi :: MODE_3; use stm32h7xx_hal :: adc; use
+    stm32h7xx_hal :: gpio :: { Analog, Output, Pin, PC0, PC1, PD10 }; use
+    stm32h7xx_hal :: prelude :: * ; use stm32h7xx_hal :: rcc :: rec ::
+    { AdcClkSel, Adc12, Spi123ClkSel, UsbClkSel }; use stm32h7xx_hal :: rcc ::
+    CoreClocks; use stm32h7xx_hal :: serial :: { self, Rx }; use stm32h7xx_hal
+    :: usb_hs :: { UsbBus, USB2 }; use stm32h7xx_hal :: { i2c, pac, spi }; use
+    usb_device :: prelude :: * ; use crate :: ahrs :: Attitude; use crate ::
+    baro :: { Baro, BaroData }; use crate :: battery :: Battery; use crate ::
+    compass :: { Compass, MagCal, MagData, MagRotation }; use crate :: crsf ::
     { CrsfParser, RcChannels }; use crate :: ekf :: { Ekf, NavSolution }; use
     crate :: esc :: { Esc, EscTelemetry }; use crate :: pwm :: MotorPwm; use
     crate :: esc_telem :: EscTelemParser; use crate :: estimator ::
@@ -70,9 +70,7 @@
     "scky-fc esc-permotor 2026-06-27"; type Imu1 = Imu < spi :: Spi < pac ::
     SPI1, spi :: Enabled > , Pin < 'A', 4, Output > > ; type Imu2 = Imu < spi
     :: Spi < pac :: SPI4, spi :: Enabled > , Pin < 'B', 1, Output > > ; type
-    I2c2 = i2c :: I2c < pac :: I2C2 > ; type MyUsbBus = UsbBus < USB2 > ; type
-    VbatPin = PC0 < Analog > ; type Adc1 = Adc < pac :: ADC1, adc :: Enabled >
-    ;
+    I2c2 = i2c :: I2c < pac :: I2C2 > ; type MyUsbBus = UsbBus < USB2 > ;
     #[doc =
     " Minimal `DelayUs` for the one-shot ADC boot calibration (SysTick is owned"]
     #[doc =
@@ -188,7 +186,9 @@
         tfl_left_parser : TfLunaParser, tfl_right_rx : Rx < pac :: UART7 > ,
         tfl_right_parser : TfLunaParser, ekf : Ekf, esc_tx_rx : Rx < pac ::
         USART3 > , esc_tx_parser : EscTelemParser, decoder : Decoder,
-        motor_pwm : MotorPwm, adc1 : Adc1, vbat_pin : VbatPin,
+        motor_pwm : MotorPwm, vbat_adc : Option < pac :: ADC1 > , vbat_prec :
+        Option < Adc12 > , vbat_clocks : CoreClocks, vbat_pin : PC0 < Analog >
+        , vbat_pin2 : PC1 < Analog > , status_led : PD10 < Output > ,
     } #[doc = r" Execution context"] #[allow(non_snake_case)]
     #[allow(non_camel_case_types)] pub struct __rtic_internal_init_Context <
     'a >
@@ -235,8 +235,7 @@
         dp.GPIOB.split(ccdr.peripheral.GPIOB); let gpioc =
         dp.GPIOC.split(ccdr.peripheral.GPIOC); let gpiod =
         dp.GPIOD.split(ccdr.peripheral.GPIOD); let gpioe =
-        dp.GPIOE.split(ccdr.peripheral.GPIOE); let mut blue_led =
-        gpioc.pc15.into_push_pull_output(); blue_led.set_low(); let spi1 =
+        dp.GPIOE.split(ccdr.peripheral.GPIOE); let spi1 =
         dp.SPI1.spi((gpioa.pa5.into_alternate :: < 5 > (),
         gpioa.pa6.into_alternate :: < 5 > (), gpioa.pa7.into_alternate :: < 5
         > (),), MODE_3, 1.MHz(), ccdr.peripheral.SPI1, & ccdr.clocks,); let
@@ -288,12 +287,11 @@
         (gpioa.pa0.into_alternate :: < 1 > (), gpioa.pa1.into_alternate :: < 1
         > (), gpioa.pa2.into_alternate :: < 1 > (), gpioa.pa3.into_alternate
         :: < 1 > (),), ccdr.peripheral.TIM2, crate :: esc :: EscConfig ::
-        new().pwm_hz, & ccdr.clocks,); let mut adc_delay = AsmDelay; let mut
-        adc1 = adc :: Adc ::
-        adc1(dp.ADC1, 4.MHz(), & mut adc_delay, ccdr.peripheral.ADC12, &
-        ccdr.clocks,).enable();
-        adc1.set_resolution(adc :: Resolution :: SixteenBit); let vbat_pin =
-        gpioc.pc0.into_analog(); let usb = USB2 ::
+        new().pwm_hz, & ccdr.clocks,); let vbat_pin = gpioc.pc0.into_analog();
+        let vbat_pin2 = gpioc.pc1.into_analog(); let vbat_adc = Some(dp.ADC1);
+        let vbat_prec = Some(ccdr.peripheral.ADC12); let vbat_clocks =
+        ccdr.clocks; let mut status_led = gpiod.pd10.into_push_pull_output();
+        status_led.set_high(); let usb = USB2 ::
         new(dp.OTG2_HS_GLOBAL, dp.OTG2_HS_DEVICE, dp.OTG2_HS_PWRCLK,
         gpioa.pa11.into_alternate :: < 10 > (), gpioa.pa12.into_alternate :: <
         10 > (), ccdr.peripheral.USB2OTG, & ccdr.clocks,); let bus_ref : &
@@ -319,7 +317,7 @@
         imu1_task :: spawn().ok(); imu2_task :: spawn().ok(); estimator_task
         :: spawn().ok(); i2c_task :: spawn().ok(); nav_task :: spawn().ok();
         ekf_task :: spawn().ok(); usb_task :: spawn().ok(); pwm_task ::
-        spawn().ok(); battery_task :: spawn().ok();
+        spawn().ok(); battery_task :: spawn().ok(); led_task :: spawn().ok();
         (Shared
         {
             out1 : ImuOut { health : h1, .. Default :: default() }, out2 :
@@ -340,7 +338,8 @@
             tfl_left_rx, tfl_left_parser : TfLunaParser :: new(),
             tfl_right_rx, tfl_right_parser : TfLunaParser :: new(), ekf : Ekf
             :: new(), esc_tx_rx, esc_tx_parser : EscTelemParser :: new(),
-            decoder : Decoder :: new(), motor_pwm, adc1, vbat_pin,
+            decoder : Decoder :: new(), motor_pwm, vbat_adc, vbat_prec,
+            vbat_clocks, vbat_pin, vbat_pin2, status_led,
         },)
     } #[allow(non_snake_case)] #[no_mangle] unsafe fn USART1()
     {
@@ -931,12 +930,21 @@
         {
             __rtic_internal_battery_taskLocalResources
             {
-                adc1 : & mut *
+                vbat_adc : & mut *
                 (& mut *
-                __rtic_internal_local_resource_adc1.get_mut()).as_mut_ptr(),
+                __rtic_internal_local_resource_vbat_adc.get_mut()).as_mut_ptr(),
+                vbat_prec : & mut *
+                (& mut *
+                __rtic_internal_local_resource_vbat_prec.get_mut()).as_mut_ptr(),
+                vbat_clocks : & mut *
+                (& mut *
+                __rtic_internal_local_resource_vbat_clocks.get_mut()).as_mut_ptr(),
                 vbat_pin : & mut *
                 (& mut *
                 __rtic_internal_local_resource_vbat_pin.get_mut()).as_mut_ptr(),
+                vbat_pin2 : & mut *
+                (& mut *
+                __rtic_internal_local_resource_vbat_pin2.get_mut()).as_mut_ptr(),
                 __rtic_internal_marker : :: core :: marker :: PhantomData,
             }
         }
@@ -949,6 +957,18 @@
                 battery : shared_resources :: battery_that_needs_to_be_locked
                 :: new(), __rtic_internal_marker : core :: marker ::
                 PhantomData,
+            }
+        }
+    } impl < 'a > __rtic_internal_led_taskLocalResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_led_taskLocalResources
+            {
+                status_led : & mut *
+                (& mut *
+                __rtic_internal_local_resource_status_led.get_mut()).as_mut_ptr(),
+                __rtic_internal_marker : :: core :: marker :: PhantomData,
             }
         }
     } impl < 'a > __rtic_internal_i2c_taskLocalResources < 'a >
@@ -1397,10 +1417,13 @@
     #[doc = "Local resources `battery_task` has access to"] pub struct
     __rtic_internal_battery_taskLocalResources < 'a >
     {
-        #[allow(missing_docs)] pub adc1 : & 'a mut Adc1,
-        #[allow(missing_docs)] pub vbat_pin : & 'a mut VbatPin, #[doc(hidden)]
-        pub __rtic_internal_marker : :: core :: marker :: PhantomData < & 'a
-        () > ,
+        #[allow(missing_docs)] pub vbat_adc : & 'a mut Option < pac :: ADC1 >
+        , #[allow(missing_docs)] pub vbat_prec : & 'a mut Option < Adc12 > ,
+        #[allow(missing_docs)] pub vbat_clocks : & 'a mut CoreClocks,
+        #[allow(missing_docs)] pub vbat_pin : & 'a mut PC0 < Analog > ,
+        #[allow(missing_docs)] pub vbat_pin2 : & 'a mut PC1 < Analog > ,
+        #[doc(hidden)] pub __rtic_internal_marker : :: core :: marker ::
+        PhantomData < & 'a () > ,
     } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
     #[doc = "Shared resources `battery_task` has access to"] pub struct
     __rtic_internal_battery_taskSharedResources < 'a >
@@ -1471,6 +1494,68 @@
         as Context; #[doc(inline)] pub use super ::
         __rtic_internal_battery_task_spawn as spawn; #[doc(inline)] pub use
         super :: __rtic_internal_battery_task_waker as waker;
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Local resources `led_task` has access to"] pub struct
+    __rtic_internal_led_taskLocalResources < 'a >
+    {
+        #[allow(missing_docs)] pub status_led : & 'a mut PD10 < Output > ,
+        #[doc(hidden)] pub __rtic_internal_marker : :: core :: marker ::
+        PhantomData < & 'a () > ,
+    } #[doc = r" Execution context"] #[allow(non_snake_case)]
+    #[allow(non_camel_case_types)] pub struct __rtic_internal_led_task_Context
+    < 'a >
+    {
+        #[doc(hidden)] __rtic_internal_p : :: core :: marker :: PhantomData <
+        & 'a () > , #[doc = r" Local Resources this task has access to"] pub
+        local : led_task :: LocalResources < 'a > ,
+    } impl < 'a > __rtic_internal_led_task_Context < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_led_task_Context
+            {
+                __rtic_internal_p : :: core :: marker :: PhantomData, local :
+                led_task :: LocalResources :: new(),
+            }
+        }
+    } #[doc = r" Spawns the task directly"] #[allow(non_snake_case)]
+    #[doc(hidden)] pub fn __rtic_internal_led_task_spawn() -> :: core ::
+    result :: Result < (), () >
+    {
+        unsafe
+        {
+            let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+            from_ptr_1_args(led_task, & __rtic_internal_led_task_EXEC); if
+            exec.try_allocate()
+            {
+                exec.spawn(led_task(unsafe { led_task :: Context :: new() }));
+                rtic :: export ::
+                pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1); Ok(())
+            } else { Err(()) }
+        }
+    } #[doc = r" Gives waker to the task"] #[allow(non_snake_case)]
+    #[doc(hidden)] pub fn __rtic_internal_led_task_waker() -> :: core :: task
+    :: Waker
+    {
+        unsafe
+        {
+            let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+            from_ptr_1_args(led_task, & __rtic_internal_led_task_EXEC);
+            exec.waker(||
+            {
+                let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+                from_ptr_1_args(led_task, & __rtic_internal_led_task_EXEC);
+                exec.set_pending(); rtic :: export ::
+                pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1);
+            })
+        }
+    } #[allow(non_snake_case)] #[doc = "Software task"] pub mod led_task
+    {
+        #[doc(inline)] pub use super :: __rtic_internal_led_taskLocalResources
+        as LocalResources; #[doc(inline)] pub use super ::
+        __rtic_internal_led_task_Context as Context; #[doc(inline)] pub use
+        super :: __rtic_internal_led_task_spawn as spawn; #[doc(inline)] pub
+        use super :: __rtic_internal_led_task_waker as waker;
     } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
     #[doc = "Local resources `i2c_task` has access to"] pub struct
     __rtic_internal_i2c_taskLocalResources < 'a >
@@ -1868,12 +1953,32 @@
     } #[allow(non_snake_case)] async fn battery_task < 'a >
     (mut cx : battery_task :: Context < 'a >)
     {
-        use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; loop
+        use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; Mono ::
+        delay(2000u32.millis()).await; let mut delay = AsmDelay; let dev =
+        cx.local.vbat_adc.take().unwrap(); let prec =
+        cx.local.vbat_prec.take().unwrap(); let mut adc = adc :: Adc ::
+        adc1(dev, 4.MHz(), & mut delay, prec, cx.local.vbat_clocks).enable();
+        adc.set_resolution(adc :: Resolution :: SixteenBit);
+        adc.set_sample_time(adc :: AdcSampleTime :: T_810); let pin0 =
+        cx.local.vbat_pin; let pin1 = cx.local.vbat_pin2; loop
         {
-            let raw : u32 =
-            cx.local.adc1.read(cx.local.vbat_pin).unwrap_or(0);
-            cx.shared.battery.lock(| b | b.update(raw)); Mono ::
+            let mut sum0 : u32 = 0; let mut sum1 : u32 = 0; for _ in 0 .. 64
+            {
+                sum0 += adc.read(pin0).unwrap_or(0); sum1 +=
+                adc.read(pin1).unwrap_or(0);
+            } let raw0 = sum0 / 64; let raw1 = sum1 / 64;
+            cx.shared.battery.lock(| b |
+            { b.raw_pc0 = raw0; b.raw_pc1 = raw1; b.update(raw1); }); Mono ::
             delay(200u32.millis()).await;
+        }
+    } #[allow(non_snake_case)] async fn led_task < 'a >
+    (cx : led_task :: Context < 'a >)
+    {
+        use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let led =
+        cx.local.status_led; loop
+        {
+            led.set_low(); Mono :: delay(100u32.millis()).await;
+            led.set_high(); Mono :: delay(900u32.millis()).await;
         }
     } #[allow(non_snake_case)] async fn i2c_task < 'a >
     (cx : i2c_task :: Context < 'a >)
@@ -2248,6 +2353,15 @@
                 (s, "GPS rx={} sat={} fix={}|MAG {} {} {:.2}", gps_rx as u8,
                 g.sats, g.fix_type, m.kind.name(), mag_state, field); let
                 frame = mavlink.statustext(6, & s);
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 1000 == 14
+            {
+                let b = battery.lock(| x | * x); let pc0_v = b.raw_pc0 as f32
+                / 65535.0 * 3.3; let pc1_v = b.raw_pc1 as f32 / 65535.0 * 3.3;
+                let mut s : heapless :: String < 50 > = heapless :: String ::
+                new(); let _ = write!
+                (s, "BAT PC0 {:.3}v PC1 {:.3}v -> {:.2}V {}%", pc0_v, pc1_v,
+                b.volts, b.percent); let frame = mavlink.statustext(6, & s);
                 pump_write(usb_dev, serial, frame.as_slice());
             } if tick % 1000 == 15
             {
@@ -2859,13 +2973,33 @@
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
     #[doc(hidden)] #[link_section = ".uninit.rtic43"] static
-    __rtic_internal_local_resource_adc1 : rtic :: RacyCell < core :: mem ::
-    MaybeUninit < Adc1 >> = rtic :: RacyCell ::
+    __rtic_internal_local_resource_vbat_adc : rtic :: RacyCell < core :: mem
+    :: MaybeUninit < Option < pac :: ADC1 > >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
     #[doc(hidden)] #[link_section = ".uninit.rtic44"] static
+    __rtic_internal_local_resource_vbat_prec : rtic :: RacyCell < core :: mem
+    :: MaybeUninit < Option < Adc12 > >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic45"] static
+    __rtic_internal_local_resource_vbat_clocks : rtic :: RacyCell < core ::
+    mem :: MaybeUninit < CoreClocks >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic46"] static
     __rtic_internal_local_resource_vbat_pin : rtic :: RacyCell < core :: mem
-    :: MaybeUninit < VbatPin >> = rtic :: RacyCell ::
+    :: MaybeUninit < PC0 < Analog > >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic47"] static
+    __rtic_internal_local_resource_vbat_pin2 : rtic :: RacyCell < core :: mem
+    :: MaybeUninit < PC1 < Analog > >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic48"] static
+    __rtic_internal_local_resource_status_led : rtic :: RacyCell < core :: mem
+    :: MaybeUninit < PD10 < Output > >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_upper_case_globals)] static __rtic_internal_imu1_task_EXEC :
     rtic :: export :: executor :: AsyncTaskExecutorPtr = rtic :: export ::
@@ -2881,6 +3015,9 @@
     AsyncTaskExecutorPtr = rtic :: export :: executor :: AsyncTaskExecutorPtr
     :: new(); #[allow(non_upper_case_globals)] static
     __rtic_internal_battery_task_EXEC : rtic :: export :: executor ::
+    AsyncTaskExecutorPtr = rtic :: export :: executor :: AsyncTaskExecutorPtr
+    :: new(); #[allow(non_upper_case_globals)] static
+    __rtic_internal_led_task_EXEC : rtic :: export :: executor ::
     AsyncTaskExecutorPtr = rtic :: export :: executor :: AsyncTaskExecutorPtr
     :: new(); #[allow(non_upper_case_globals)] static
     __rtic_internal_i2c_task_EXEC : rtic :: export :: executor ::
@@ -2926,6 +3063,14 @@
             {
                 let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
                 from_ptr_1_args(i2c_task, & __rtic_internal_i2c_task_EXEC);
+                exec.set_pending(); rtic :: export ::
+                pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1);
+            }); let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+            from_ptr_1_args(led_task, & __rtic_internal_led_task_EXEC);
+            exec.poll(||
+            {
+                let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+                from_ptr_1_args(led_task, & __rtic_internal_led_task_EXEC);
                 exec.set_pending(); rtic :: export ::
                 pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1);
             }); let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
@@ -3149,6 +3294,11 @@
         __rtic_internal_battery_task_EXEC.set_in_main(& executor); let
         executor = :: core :: mem :: ManuallyDrop ::
         new(rtic :: export :: executor :: AsyncTaskExecutor ::
+        new_1_args(led_task)); executors_size += :: core :: mem ::
+        size_of_val(& executor);
+        __rtic_internal_led_task_EXEC.set_in_main(& executor); let executor =
+        :: core :: mem :: ManuallyDrop ::
+        new(rtic :: export :: executor :: AsyncTaskExecutor ::
         new_1_args(i2c_task)); executors_size += :: core :: mem ::
         size_of_val(& executor);
         __rtic_internal_i2c_task_EXEC.set_in_main(& executor); let executor =
@@ -3264,10 +3414,18 @@
             :: MaybeUninit :: new(local_resources.decoder));
             __rtic_internal_local_resource_motor_pwm.get_mut().write(core ::
             mem :: MaybeUninit :: new(local_resources.motor_pwm));
-            __rtic_internal_local_resource_adc1.get_mut().write(core :: mem ::
-            MaybeUninit :: new(local_resources.adc1));
+            __rtic_internal_local_resource_vbat_adc.get_mut().write(core ::
+            mem :: MaybeUninit :: new(local_resources.vbat_adc));
+            __rtic_internal_local_resource_vbat_prec.get_mut().write(core ::
+            mem :: MaybeUninit :: new(local_resources.vbat_prec));
+            __rtic_internal_local_resource_vbat_clocks.get_mut().write(core ::
+            mem :: MaybeUninit :: new(local_resources.vbat_clocks));
             __rtic_internal_local_resource_vbat_pin.get_mut().write(core ::
-            mem :: MaybeUninit :: new(local_resources.vbat_pin)); rtic ::
+            mem :: MaybeUninit :: new(local_resources.vbat_pin));
+            __rtic_internal_local_resource_vbat_pin2.get_mut().write(core ::
+            mem :: MaybeUninit :: new(local_resources.vbat_pin2));
+            __rtic_internal_local_resource_status_led.get_mut().write(core ::
+            mem :: MaybeUninit :: new(local_resources.status_led)); rtic ::
             export :: interrupt :: enable();
         }); loop {}
     }

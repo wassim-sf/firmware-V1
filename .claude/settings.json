@@ -45,7 +45,8 @@
       "Bash(grep -nA0 \"last_rx_diag_ms\")",
       "Bash(python3 -c \"import json;d=json.load\\(open\\('arducopter.apj'\\)\\);print\\({k:d[k] for k in d if k!='image'}\\)\")",
       "Bash(grep -n \"escStopAll\\(\\)\\\\|escCommand\\(target\\\\|^  start\\(\\)\\\\|^export const bus\\\\|  escCalibrate\\\\|notify\\(\\)$\" src/system/telemetry.ts)",
-      "Bash(grep -rn \"voltage: 0, current\\\\|percent: 0\\\\|battery: {\" src/system/telemetry.ts)"
+      "Bash(grep -rn \"voltage: 0, current\\\\|percent: 0\\\\|battery: {\" src/system/telemetry.ts)",
+      "WebSearch"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"
