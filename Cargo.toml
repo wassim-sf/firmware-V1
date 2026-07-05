@@ -68,5 +68,9 @@ lto = false
 [profile.release]
 opt-level = "s"
 debug = true        # keep symbols for probe-rs / defmt; stripped from .bin
-lto = "fat"
+# LTO disabled 2026-07: fat cross-crate LTO (with opt-level="s") miscompiled the
+# added scky-control math crate, hard-faulting at boot in `Control::new()`.
+# Disabling LTO is the standard workaround; the binary is a little larger but
+# still trivially fits the 2 MB flash.
+lto = false
 codegen-units = 1

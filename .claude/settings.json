@@ -52,7 +52,8 @@
       "Bash(awk '/fn apply_inbound/,/^    }$/' src/main.rs)",
       "Bash(cargo size *)",
       "Bash(cargo clippy *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash([ -f \"$EXP\" ])"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"
