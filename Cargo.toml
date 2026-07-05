@@ -7,6 +7,16 @@ description = "RTIC flight-controller firmware for the DAKEFPVH743 (STM32H743) b
 license = "MIT OR Apache-2.0"
 
 # ---------------------------------------------------------------------------
+# Workspace: the firmware bin (this crate, the workspace root) plus the
+# host-testable `scky-control` control-law library. The library is `no_std`
+# inside the firmware but builds with `std` under `cargo test`, so the flight
+# control maths can be unit-tested on the host:
+#     cargo test --target x86_64-unknown-linux-gnu -p scky-control
+# ---------------------------------------------------------------------------
+[workspace]
+members = ["control"]
+
+# ---------------------------------------------------------------------------
 # Single binary: the flight-controller firmware.
 # ---------------------------------------------------------------------------
 [[bin]]
@@ -35,6 +45,10 @@ embedded-hal = "0.2.7"
 # USB CDC-ACM stack -------------------------------------------------------
 usb-device = "0.3"
 usbd-serial = "0.2"
+
+# Flight control law (geometric SE(3) tracking controller) — a `no_std`
+# library shared with the host test build. See the `control/` workspace member.
+scky-control = { path = "control" }
 
 # Utilities ---------------------------------------------------------------
 libm = "0.2"          # atan2f/sqrtf for roll/pitch from the gravity vector

@@ -1,0 +1,3 @@
+cargo:rustc-link-search=/home/poorcsky/Documents/scky_firmware/target/thumbv7em-none-eabihf/release/build/scky-fc-d39d5682e3606236/out
+cargo:rerun-if-changed=memory.x
+cargo:rerun-if-changed=build.rs

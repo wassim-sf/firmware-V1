@@ -46,7 +46,13 @@
       "Bash(python3 -c \"import json;d=json.load\\(open\\('arducopter.apj'\\)\\);print\\({k:d[k] for k in d if k!='image'}\\)\")",
       "Bash(grep -n \"escStopAll\\(\\)\\\\|escCommand\\(target\\\\|^  start\\(\\)\\\\|^export const bus\\\\|  escCalibrate\\\\|notify\\(\\)$\" src/system/telemetry.ts)",
       "Bash(grep -rn \"voltage: 0, current\\\\|percent: 0\\\\|battery: {\" src/system/telemetry.ts)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(awk '/pub struct NavSolution/,/^}/' src/ekf.rs)",
+      "Bash(awk '/pub enum Inbound/,/^}/' src/mavlink.rs)",
+      "Bash(awk '/fn apply_inbound/,/^    }$/' src/main.rs)",
+      "Bash(cargo size *)",
+      "Bash(cargo clippy *)",
+      "Bash(git checkout *)"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"

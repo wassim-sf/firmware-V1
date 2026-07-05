@@ -1,0 +1,17 @@
+[package]
+name = "scky-control"
+version = "0.1.0"
+edition = "2021"
+authors = ["scky"]
+description = "Geometric SE(3) flight-control law for scky-fc (host-testable, no_std in firmware)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# The firmware never links a test harness; host `cargo test` does. Keeping the
+# default (`test = true`) is what lets `cargo test -p scky-control` run.
+bench = false
+
+[dependencies]
+# libm gives us sinf/cosf/sqrtf/atan2f both in `no_std` (firmware) and on the
+# host, so the maths is bit-for-bit the same in tests and in flight.
+libm = "0.2"

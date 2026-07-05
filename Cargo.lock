@@ -370,6 +370,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scky-control"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "scky-fc"
 version = "0.1.0"
 dependencies = [
@@ -382,6 +389,7 @@ dependencies = [
  "panic-halt",
  "rtic",
  "rtic-monotonics",
+ "scky-control",
  "stm32h7xx-hal",
  "usb-device",
  "usbd-serial",

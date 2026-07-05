@@ -41,6 +41,11 @@ const PULSE_MAX: u16 = 2200;
 /// watchdog horizon: if the host stops talking, motors stop within this window.
 pub const DEFAULT_TEST_TIMEOUT_MS: u32 = 3000;
 
+/// Flight-control watchdog (ms): if the closed-loop `control_task` stops refreshing
+/// the per-motor commands (a hung task), the motors revert to idle and disarm
+/// within this window. Must comfortably exceed the control-loop period.
+pub const FLIGHT_TIMEOUT_MS: u32 = 100;
+
 /// Range-teach routine phase durations (ms): full throttle held, then idle held.
 /// Safety timeout (ms): if the host leaves the ESCs held at a calibration
 /// endpoint (e.g. it disconnects mid-calibration), auto-return to idle.
@@ -174,6 +179,27 @@ impl MotorOut {
 
 const INIT_MOTOR: MotorOut = MotorOut::new();
 
+/// Closed-loop flight command: per-**logical**-motor throttle fractions from the
+/// mixer, an armed interlock, and the timestamp of the last refresh (for the
+/// [`FLIGHT_TIMEOUT_MS`] watchdog). This is the path the geometric controller
+/// drives; it takes precedence over the bench motor-test path when armed & fresh.
+#[derive(Clone, Copy)]
+struct FlightInput {
+    cmds: [f32; N_MOTORS],
+    armed: bool,
+    stamp_ms: u32,
+}
+
+impl FlightInput {
+    const fn new() -> Self {
+        Self {
+            cmds: [0.0; N_MOTORS],
+            armed: false,
+            stamp_ms: 0,
+        }
+    }
+}
+
 /// Throttle-range teach routine state. Each hold persists until the operator
 /// moves to the next step or the [`CAL_SAFETY_MS`] deadline elapses.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,6 +217,8 @@ pub struct Esc {
     motors: [MotorOut; N_MOTORS],
     cal_phase: CalPhase,
     cal_until_ms: u32,
+    /// Closed-loop flight command (see [`FlightInput`]).
+    flight: FlightInput,
 }
 
 /// Slew the currently applied pulse toward `target_us`. Increases are capped at
@@ -211,7 +239,26 @@ impl Esc {
             motors: [INIT_MOTOR; N_MOTORS],
             cal_phase: CalPhase::Idle,
             cal_until_ms: 0,
+            flight: FlightInput::new(),
         }
+    }
+
+    /// Publish one closed-loop control step: per-logical-motor throttle fractions
+    /// (`[0,1]`, mixer output) plus the armed interlock. When `armed` is true and
+    /// the input stays fresh (within [`FLIGHT_TIMEOUT_MS`]), [`Self::pulses`] flies
+    /// these commands, overriding the bench motor-test path. Disarming (or a stale
+    /// input) drops straight back to idle. Called at the control-loop rate.
+    pub fn set_flight(&mut self, cmds: [f32; N_MOTORS], armed: bool, now_ms: u32) {
+        for i in 0..N_MOTORS {
+            self.flight.cmds[i] = cmds[i].clamp(0.0, 1.0);
+        }
+        self.flight.armed = armed;
+        self.flight.stamp_ms = now_ms;
+    }
+
+    /// Whether the closed loop currently holds the output (armed + fresh input).
+    pub fn flight_active(&self, now_ms: u32) -> bool {
+        self.flight.armed && now_ms.wrapping_sub(self.flight.stamp_ms) < FLIGHT_TIMEOUT_MS
     }
 
     /// Pulse (µs) for a logical motor at throttle fraction `t`, using that
@@ -386,6 +433,26 @@ impl Esc {
             CalPhase::Idle => {}
         }
 
+        // Closed-loop flight path takes precedence when armed & fresh: fly the
+        // mixer's per-logical-motor commands (ramped) and remap to physical
+        // channels. Its own `armed` flag is the interlock, independent of the GS
+        // master toggle. A stale input while still flagged armed trips the
+        // watchdog and drops back to idle.
+        if self.flight.armed {
+            if now_ms.wrapping_sub(self.flight.stamp_ms) < FLIGHT_TIMEOUT_MS {
+                let mut logical = [MIN_US_DEFAULT; N_MOTORS];
+                for i in 0..N_MOTORS {
+                    let target_us = self.pulse_for(i, self.flight.cmds[i]);
+                    let next = slew(self.motors[i].applied_us, target_us);
+                    self.motors[i].applied_us = next;
+                    logical[i] = next;
+                }
+                return self.remap(logical);
+            }
+            // Watchdog: the control task went silent — disarm the flight path.
+            self.flight.armed = false;
+        }
+
         // Compute a pulse per logical motor, then remap to physical channels.
         let mut logical = [MIN_US_DEFAULT; N_MOTORS];
         for i in 0..N_MOTORS {
@@ -406,7 +473,12 @@ impl Esc {
             };
         }
 
-        // Remap: logical motor i -> physical channel output_map[i].
+        self.remap(logical)
+    }
+
+    /// Remap logical motors to physical channels: logical motor `i` drives
+    /// physical output `output_map[i]`. Channels with no logical source idle.
+    fn remap(&self, logical: [u16; N_MOTORS]) -> [u16; N_MOTORS] {
         let mut out = [MIN_US_DEFAULT; N_MOTORS];
         for i in 0..N_MOTORS {
             let ch = self.config.output_map[i] as usize;

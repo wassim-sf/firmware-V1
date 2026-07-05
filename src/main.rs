@@ -25,6 +25,7 @@ mod ahrs;
 mod baro;
 mod battery;
 mod compass;
+mod control;
 mod crsf;
 mod ekf;
 mod esc;
@@ -71,6 +72,7 @@ mod app {
     use crate::baro::{Baro, BaroData};
     use crate::battery::Battery;
     use crate::compass::{Compass, MagCal, MagData, MagRotation};
+    use crate::control::Control;
     use crate::crsf::{CrsfParser, RcChannels};
     use crate::ekf::{Ekf, NavSolution};
     use crate::esc::{Esc, EscTelemetry};
@@ -226,6 +228,9 @@ mod app {
         decoder: Decoder,
         // Hardware TIM2 PWM output for the four analog ESCs, owned by `pwm_task`.
         motor_pwm: MotorPwm,
+        // Closed-loop geometric flight controller + arming state, owned by
+        // `control_task`.
+        control: Control,
         // VBAT ADC pieces, consumed once by `battery_task` (which builds the ADC
         // *after* USB is up so its blocking calibration can never stall boot).
         vbat_adc: Option<pac::ADC1>,
@@ -529,6 +534,7 @@ mod app {
         ekf_task::spawn().ok();
         usb_task::spawn().ok();
         pwm_task::spawn().ok();
+        control_task::spawn().ok();
         battery_task::spawn().ok();
         led_task::spawn().ok();
 
@@ -585,6 +591,7 @@ mod app {
                 esc_tx_parser: EscTelemParser::new(),
                 decoder: Decoder::new(),
                 motor_pwm,
+                control: Control::new(),
                 vbat_adc,
                 vbat_prec,
                 vbat_clocks,
@@ -802,6 +809,40 @@ mod app {
                 cx.local.motor_pwm.set_pulse_us(ch, us);
             }
             Mono::delay(5u32.millis()).await;
+        }
+    }
+
+    /// Closed-loop geometric flight control — 500 Hz. Reads the fused attitude, the
+    /// EKF nav solution and the RC sticks; runs the geometric SE(3) controller +
+    /// normalised mixer (both host-tested in `scky-control`); and publishes
+    /// per-logical-motor commands to the ESC flight path, which `pwm_task` applies.
+    /// Owns the arming state machine + RC failsafe. Priority 1, so IMU sampling
+    /// (prio 3) and the estimator (prio 2) always preempt it; the control period
+    /// ([`crate::control::CONTROL_DT`]) matches this task's 2 ms delay.
+    #[task(priority = 1, local = [control], shared = [att, navsol, rc, esc])]
+    async fn control_task(cx: control_task::Context) {
+        let control = cx.local.control;
+        let control_task::SharedResources {
+            mut att,
+            mut navsol,
+            mut rc,
+            mut esc,
+            ..
+        } = cx.shared;
+        // Hold the control loop off until USB has enumerated. Like `battery_task`,
+        // a task that runs from the first millisecond of boot shares the priority-1
+        // dispatcher through the USB enumeration window and can hide the board from
+        // the host (no /dev/ttyACM). The aircraft can't be armed this early anyway,
+        // and the motors idle via `pwm_task` throughout this delay.
+        Mono::delay(3000u32.millis()).await;
+        loop {
+            let now = Mono::now().ticks() as u32;
+            let a = att.lock(|a| *a);
+            let nv = navsol.lock(|n| *n);
+            let r = rc.lock(|r| *r);
+            let (cmds, armed) = control.update(&a, &nv, &r, now);
+            esc.lock(|e| e.set_flight(cmds, armed, now));
+            Mono::delay(2u32.millis()).await;
         }
     }
 
