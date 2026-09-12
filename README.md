@@ -1,4 +1,4 @@
-# scky-fc — RTIC Flight-Controller Firmware (STM32H743 / DAKEFPVH743)
+# CSky-fc — RTIC Flight-Controller Firmware (STM32H743 / DAKEFPVH743)
 
 A from-scratch, [RTIC](https://rtic.rs)-based flight-controller firmware in Rust
 for the **DAKEFPV H743** flight controller, intended to eventually replace
